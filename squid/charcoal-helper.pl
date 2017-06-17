@@ -37,7 +37,7 @@ if ($h){
 }
 
 if ( @ARGV < 1){
-	print STDERR "BH message=Usage: $0 -[cdh] <api-key>\n";
+	print STDERR "BH message=\"Usage: $0 -[cdh] <api-key>\"\n";
 	exit 1;
 }
 
@@ -95,6 +95,14 @@ print STDERR "Running for Squid Version $squidver\n";
 #
 
 
+$SIG{PIPE} = sub {
+				print STDERR "ERROR: Charcoal: Lost connection to server: $!\n";
+				print "BH message=\"Charcoal: Lost connection to server: $!\"\n";
+				return 1;
+			};
+
+my $socket = new_socket();
+
 while(<>){
 
 	chomp;
@@ -105,51 +113,85 @@ while(<>){
 
 	print STDERR scalar(@chunks) . " chunks received \n" if $DEBUG;
 
+	$socket = new_socket() if (!$socket->connected());
+
 	if ($chunks[0] =~ m/^\d+/){
 	### Concurrency enabled
 		print STDERR "Concurrency Enabled\n" if $DEBUG;
 		my ($chan, $url, $clientip, $ident, $method, $blah, $proxyip, $proxyport) = split(/\s+/);
-		print STDERR "Sending $apikey|$squidver|$clientip|$ident|$method|$blah|$url\n" if $DEBUG;
-		my $sock = IO::Socket::INET->new(PeerAddr  => $charcoal_server,
-					PeerPort   => $charcoal_port,
-					Proto	   => $proto,
-					Timeout	   => $timeout,
-#					MultiHomed => 1,
-#					Blocking   => 1,
-				) || (print STDERR "BH message=Error connecting to charcoal server $!\n" && die);
+		my $query = "$apikey|$squidver|$clientip|$ident|$method|$blah|$url";
+		my $access = get_access($query);
 
-		print STDERR "Connected to $charcoal_server on $proto port $charcoal_port.\n" if $DEBUG;
+		if ($access =~ /Timed Out/ or !$access or $access eq "\r\n"){
+			print STDERR "WARNING: Charcoal Server connection closed. Reattempting query.\n";
+			$socket = new_socket();
+			$access = get_access($query);
+			if ($access =~ /Timed Out/ or !$access or $access eq "\r\n"){
+				print STDERR "ERROR: Charcoal: Server connection closed again.\n";
+				print STDOUT "BH message=\"Charcoal: Server connection closed while querying. Giving up on this query.\"\n";
+				next;
+			}
+		}
 
-		print $sock "$apikey|$squidver|$clientip|$ident|$method|$blah|$url\r\n";
-		my $access = <$sock>;
 		chomp $access;
+
 		my $res = $chan . ' ' . $access;
-		$sock->close();
-		print "$res\n";
+		print STDOUT "$res\n";
 		print STDERR "$res\n" if $DEBUG;
+		next;
 	}
 
 	else {
 	### Concurrency disabled
 		print STDERR "Concurrency Disabled\n" if $DEBUG;
 		my ($url, $clientip, $ident, $method, $blah, $proxyip, $proxyport) = split(/\s+/);
-		print STDERR "Sending $apikey|$squidver|$clientip|$ident|$method|$blah|$url\n" if $DEBUG;
-		my $sock = IO::Socket::INET->new(PeerAddr  => $charcoal_server,
-					PeerPort   => $charcoal_port,
-					Proto	   => $proto,
-					Timeout	   => $timeout,
-					MultiHomed => 1,
-					Blocking   => 1,
-				) || (print STDERR "BH message=Error connecting to charcoal server $!\n" && die);
+		my $query = "$apikey|$squidver|$clientip|$ident|$method|$blah|$url";
+		my $access = get_access($query);
 
-		print STDERR "Connected to $charcoal_server on $proto port $charcoal_port.\n" if $DEBUG;
-		print $sock "$apikey|$squidver|$clientip|$ident|$method|$blah|$url\r\n";
-		my $access = <$sock>;
+		if ($access =~ /Timed Out/ or !$access or $access eq "\r\n"){
+			print STDERR "WARNING: Charcoal Server connection closed. Reattempting query.\n";
+			$socket = new_socket();
+			$access = get_access($query);
+			if ($access =~ /Timed Out/ or !$access or $access eq "\r\n"){
+				print STDERR "ERROR: Charcoal: Server connection closed again.\n";
+				print STDOUT "BH message=\"Charcoal: Server connection closed while querying. Giving up on this query.\"\n";
+				next;
+			}
+		}
+
 		chomp $access;
+
 		my $res = $access;
-		$sock->close();
-		print "$res\n";
+		print STDOUT "$res\n";
 		print STDERR "$res\n" if $DEBUG;
 	}
 
+}
+
+sub get_access {
+	my $query = shift;
+	print STDERR "Charcoal: Sending $query\n" if $DEBUG;
+	print $socket "$query\r\n";
+	my $access = <$socket>;
+	print STDERR "Charcoal: get_access ACCESS: $access\n" if $DEBUG;
+	return $access;
+}
+
+sub new_socket {
+	my $sock = IO::Socket::INET->new(PeerAddr  => $charcoal_server,
+			PeerPort   => $charcoal_port,
+			Proto	   => $proto,
+			Timeout	   => $timeout,
+			Type	   => SOCK_STREAM,
+		);
+
+	if (!$sock) {
+		print STDOUT "BH message=\"Charcoal: Error connecting to server. $!\"\n";
+		print STDERR "FATAL: Charcoal: Error connecting to server. $!\n"; 
+		die;
+	}
+
+	print STDERR "Charcoal: Connected to $charcoal_server on $proto port $charcoal_port.\n" if $DEBUG;
+
+	return $sock;
 }
