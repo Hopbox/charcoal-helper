@@ -28,12 +28,11 @@ Squid-2.x is supported in compatibility mode with *-c* argument to the helper. W
 We will add support for Squid-4.x soon.
 
 ## Setup and Configuration
-
 Add following lines to *squid.conf*:
 
-*url_rewrite_program /path/to/charcoal-helper.pl YOUR_API_KEY*
+`url_rewrite_program /path/to/charcoal-helper.pl YOUR_API_KEY`
 
-*url_rewrite_children X startup=Y idle=Z concurrency=1*
+`url_rewrite_children X startup=Y idle=Z concurrency=1`
 
 Adjust the values of X, Y and Z for your environment. Typically, X=10, Y=2 and Z=1 works fine on 
 ALIX and Routerboard with around 10 machines in the network.
