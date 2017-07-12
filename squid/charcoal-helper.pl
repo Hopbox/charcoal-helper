@@ -45,8 +45,17 @@ if ( @ARGV < 1){
 #########
 ## Server: charcoal.hopbox.in
 ## Port  : 80
-##
+## Uncomment server closest to your location - India, EU, US
+
+# Servers for India
 my $charcoal_server = 'active.charcoal.io';
+
+# Servers for EU
+#my $charcoal_server = 'eu.active.charcoal.io';
+
+# Server for US
+#my $charcoal_server = 'us.active.charcoal.io';
+
 my $charcoal_port   = '6603';
 my $proto           = 'tcp';
 my $timeout         = 10;
