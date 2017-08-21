@@ -35,9 +35,36 @@ The result for each request is cached in memcached and charcoal server is not qu
 To install memcached on your machine, please refer to the documentation provided by your distribution. For Debian/Ubuntu, you may follow these steps:
 
 `apt-get update`
+
 `apt-get install memcached`
+
 `systemctl enable memcached`
+
 `systemctl restart memcached`
+
+Following is a transcript of a successful telnet session to memcached:
+
+`telnet localhost 11211
+Trying 127.0.0.1...
+Connected to localhost.
+Escape character is '^]'.
+stats
+STAT pid 1108
+STAT uptime 11402
+STAT time 1503303182
+STAT version 1.4.25 Ubuntu
+STAT libevent 2.0.21-stable
+STAT pointer_size 64
+STAT rusage_user 0.144000
+STAT rusage_system 0.176000
+STAT curr_connections 5
+STAT total_connections 7
+...
+...
+...
+END
+quit
+Connection closed by foreign host.`
 
 ## Squid Versions supported
 
@@ -49,7 +76,7 @@ Add following lines to *squid.conf*:
 
 `url_rewrite_program /path/to/charcoal-helper.pl YOUR_API_KEY`
 
-`url_rewrite_children X startup=Y idle=Z concurrency=1
+`url_rewrite_children X startup=Y idle=Z concurrency=1`
 
 Adjust the values of X, Y and Z for your environment. Typically, X=10, Y=2 and Z=1 works fine on 
 ALIX and Routerboard with around 10 machines in the network.
