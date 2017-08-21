@@ -3,7 +3,7 @@
 
 Copyright Unmukti Technology Private Limited, India
 
-Licensed under GNU General Public License. See LICENES for more details.
+Licensed under GNU General Public License. See LICENCE for more details.
 
 ## System Requirements
 
@@ -21,6 +21,16 @@ It can run on any POSIX compliant Unix system which has:
 
 + Perl >= 5.14.x
     - IO::Socket
+    - optionally Cache::Memcached::Fast (for memcached enabled helper)
+
+## Memcached Support
+A local memcached server is required on Squid machine. Cache::Memcached::Fast module is required to use memcached. The helper file with memcached support is `charcoal-helper-memcached.pl`.
+
+Default time for caching the results is 60 seconds.
+
+`my $CACHE_TIME = 60;`
+
+The results for each request are cached in memcached and charcoal server is not queried unless result is found in the cache.
 
 ## Squid Versions supported
 
@@ -32,7 +42,7 @@ Add following lines to *squid.conf*:
 
 `url_rewrite_program /path/to/charcoal-helper.pl YOUR_API_KEY`
 
-`url_rewrite_children X startup=Y idle=Z concurrency=1`
+`url_rewrite_children X startup=Y idle=Z concurrency=1
 
 Adjust the values of X, Y and Z for your environment. Typically, X=10, Y=2 and Z=1 works fine on 
 ALIX and Routerboard with around 10 machines in the network.
@@ -42,5 +52,3 @@ In order to obtain API key, kindly write to [charcoal@hopbox.in](mailto:charcoal
 ## Managing the ACL rules
 
 Head to [active.charcoal.io](https://active.charcoal.io) and login with the credentials provided with the API key.
-
-
