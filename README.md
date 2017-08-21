@@ -44,7 +44,8 @@ To install memcached on your machine, please refer to the documentation provided
 
 Following is a transcript of a successful telnet session to memcached:
 
-```telnet localhost 11211
+```
+telnet localhost 11211
 Trying 127.0.0.1...
 Connected to localhost.
 Escape character is '^]'.
@@ -75,7 +76,8 @@ We will add support for Squid-4.x soon.
 ## Setup and Configuration
 Add following lines to *squid.conf*:
 
-```url_rewrite_program /path/to/charcoal-helper.pl YOUR_API_KEY
+```
+url_rewrite_program /path/to/charcoal-helper.pl YOUR_API_KEY
 url_rewrite_children X startup=Y idle=Z concurrency=1
 ```
 
