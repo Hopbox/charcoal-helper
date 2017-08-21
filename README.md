@@ -30,7 +30,14 @@ Default time for caching the results is 60 seconds.
 
 `my $CACHE_TIME = 60;`
 
-The results for each request are cached in memcached and charcoal server is not queried unless result is found in the cache.
+The result for each request is cached in memcached and charcoal server is not queried unless result is found in the cache.
+
+To install memcached on your machine, please refer to the documentation provided by your distribution. For Debian/Ubuntu, you may follow these steps:
+
+`apt-get update`
+`apt-get install memcached`
+`systemctl enable memcached`
+`systemctl restart memcached`
 
 ## Squid Versions supported
 
