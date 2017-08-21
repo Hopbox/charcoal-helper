@@ -24,7 +24,7 @@ It can run on any POSIX compliant Unix system which has:
     - optionally Cache::Memcached::Fast (for memcached enabled helper)
 
 ## Memcached Support
-A local memcached server is required on Squid machine. Cache::Memcached::Fast module is required to use memcached. The helper file with memcached support is `charcoal-helper-memcached.pl`.
+A local memcached server is required on Squid machine. `Cache::Memcached::Fast` module is required to use memcached. The helper file with memcached support is `charcoal-helper-memcached.pl`.
 
 Default time for caching the results is 60 seconds.
 
@@ -70,11 +70,11 @@ Connection closed by foreign host.
 
 ## Squid Versions supported
 
-Squid-2.x is supported in compatibility mode with *-c* argument to the helper. While Squid-3.x is supported natively.
+Squid-2.x is supported in compatibility mode with `-c` argument to the helper. While Squid-3.x is supported natively.
 We will add support for Squid-4.x soon.
 
 ## Setup and Configuration
-Add following lines to *squid.conf*:
+Add following lines to `squid.conf`:
 
 ```
 url_rewrite_program /path/to/charcoal-helper.pl YOUR_API_KEY
