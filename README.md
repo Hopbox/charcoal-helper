@@ -44,7 +44,7 @@ To install memcached on your machine, please refer to the documentation provided
 
 Following is a transcript of a successful telnet session to memcached:
 
-`telnet localhost 11211
+```telnet localhost 11211
 Trying 127.0.0.1...
 Connected to localhost.
 Escape character is '^]'.
@@ -64,7 +64,7 @@ STAT total_connections 7
 ...
 END
 quit
-Connection closed by foreign host.`
+Connection closed by foreign host.```
 
 ## Squid Versions supported
 
