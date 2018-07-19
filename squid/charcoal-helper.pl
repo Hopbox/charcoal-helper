@@ -130,16 +130,31 @@ while(<>){
 		my ($chan, $url, $clientip, $ident, $method, $blah, $proxyip, $proxyport) = split(/\s+/);
 		my $query = "$apikey|$squidver|$clientip|$ident|$method|$blah|$url";
 		my $access = get_access($query);
-
-		if ($access =~ /Timed Out/ or ( (!$access or $access eq "\r\n") and $squidver != 2) )  {
-			print STDERR "WARNING: Charcoal Server connection closed. Reattempting query.\n";
-			$socket = new_socket();
-			$access = get_access($query);
-			if ($access =~ /Timed Out/ or ( (!$access or $access eq "\r\n") and $squidver != 2) ) {
-				print STDERR "ERROR: Charcoal: Server connection closed again.\n";
-				print STDOUT "BH message=\"Charcoal: Server connection closed while querying. Giving up on this query.\"\n";
-				next;
+		
+		if ($squidver == 2){
+			if ($access =~ /Timed Out/)  {
+				print STDERR "WARNING: Charcoal Server connection closed. Reattempting query.\n";
+				$socket = new_socket();
+				$access = get_access($query);
+				if ($access =~ /Timed Out/) {
+					print STDERR "ERROR: Charcoal: Server connection closed again.\n";
+					print STDOUT "BH message=\"Charcoal: Server connection closed while querying. Giving up on this query.\"\n";
+					next;
+				}
 			}
+		}
+		else {
+			if ($access =~ /Timed Out/ or !$access or $access eq "\r\n") {
+				print STDERR "WARNING: Charcoal Server connection closed. Reattempting query.\n";
+				$socket = new_socket();
+				$access = get_access($query);
+				if ($access =~ /Timed Out/ or !$access or $access eq "\r\n") {
+					print STDERR "ERROR: Charcoal: Server connection closed again.\n";
+					print STDOUT "BH message=\"Charcoal: Server connection closed while querying. Giving up on this query.\"\n";
+					next;
+				}
+			}
+
 		}
 
 		chomp $access;
@@ -157,14 +172,28 @@ while(<>){
 		my $query = "$apikey|$squidver|$clientip|$ident|$method|$blah|$url";
 		my $access = get_access($query);
 
-		if ($access =~ /Timed Out/ or ( (!$access or $access eq "\r\n") and $squidver != 2) ) {
-			print STDERR "WARNING: Charcoal Server connection closed. Reattempting query.\n";
-			$socket = new_socket();
-			$access = get_access($query);
-			if ($access =~ /Timed Out/ or ( (!$access or $access eq "\r\n") and $squidver != 2) ) {
-				print STDERR "ERROR: Charcoal: Server connection closed again.\n";
-				print STDOUT "BH message=\"Charcoal: Server connection closed while querying. Giving up on this query.\"\n";
-				next;
+		if ($squidver == 2){
+			if ($access =~ /Timed Out/)  {
+				print STDERR "WARNING: Charcoal Server connection closed. Reattempting query.\n";
+				$socket = new_socket();
+				$access = get_access($query);
+				if ($access =~ /Timed Out/) {
+					print STDERR "ERROR: Charcoal: Server connection closed again.\n";
+					print STDOUT "BH message=\"Charcoal: Server connection closed while querying. Giving up on this query.\"\n";
+					next;
+				}
+			}
+		}
+		else {
+			if ($access =~ /Timed Out/ or !$access or $access eq "\r\n") {
+				print STDERR "WARNING: Charcoal Server connection closed. Reattempting query.\n";
+				$socket = new_socket();
+				$access = get_access($query);
+				if ($access =~ /Timed Out/ or !$access or $access eq "\r\n") {
+					print STDERR "ERROR: Charcoal: Server connection closed again.\n";
+					print STDOUT "BH message=\"Charcoal: Server connection closed while querying. Giving up on this query.\"\n";
+					next;
+				}
 			}
 		}
 
