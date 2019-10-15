@@ -18,7 +18,7 @@
 # Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
 
 use IO::Socket;
-use Cache::Memcached;
+use Cache::Memcached::Fast;
 
 $|=1; #Flush after write
 
@@ -259,10 +259,19 @@ sub new_socket {
 
 sub connect_cache {
 	print STDERR "Connecting to memcached...\n";
-	$memd = new Cache::Memcached {
-		'servers'	=> [ "127.0.0.1:11211" ],
-		'debug'		=> 0,		
-		'compress_threshold' => 10_1000,
-	};
+	$memd = new Cache::Memcached::Fast({
+		servers         => [{ address => 'localhost:11211'}],
+		namespace       => 'charcoal:',
+		connect_timeout => 0.2,
+		io_timeout      => 0.5,
+		close_on_error  => 1,
+		max_failures    => 3,
+		failure_timeout => 2,
+		ketama_points   => 150,
+		hash_namespace => 1,
+		serialize_methods => [ \&Storable::freeze, \&Storable::thaw ],
+		utf8 => ($^V ge v5.8.1 ? 1 : 0),
+		max_size => 512 * 1024,
+	});
 
 }
