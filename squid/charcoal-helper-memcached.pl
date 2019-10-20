@@ -24,7 +24,7 @@ $|=1; #Flush after write
 
 my $DEBUG = 1 if $d;
 my $CACHE = 0;
-my $CACHE_TIME = 60;
+my $CACHE_TIME = 300;
 
 my $squidver = 3;
 $squidver = 2 if $c;
