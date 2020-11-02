@@ -22,6 +22,7 @@ It can run on any POSIX compliant Unix system which has:
 + Perl >= 5.14.x
     - IO::Socket
     - optionally Cache::Memcached::Fast (for memcached enabled helper)
+    - Cache:Memcached on OpenWrt
 
 ## Memcached Support
 A local memcached server is required on Squid machine. `Cache::Memcached::Fast` module is required to use memcached. The helper file with memcached support is `charcoal-helper-memcached.pl`.
@@ -79,6 +80,15 @@ Add following lines to `squid.conf`:
 ```
 url_rewrite_program /path/to/charcoal-helper.pl YOUR_API_KEY
 url_rewrite_children X startup=Y idle=Z concurrency=1
+```
+
+Configuration as External ACL Helper:
+
+```
+external_acl_type charcoal_helper ttl=60 negative_ttl=60 children-max=25 children-startup=5 children-idle=2 concurrency=10 %URI %SRC %IDENT %METHOD %% %MYADDR %MYPORT /etc/config/squid-helpers/charcoal-helper-ext-memcached.pl <API_KEY>
+acl charcoal external charcoal_helper
+http_access deny !charcoal
+#deny_info http://your-deny-domain/cgi-bin/blockmsg.cgi?url=%u&clientaddr=%i&clientuser=%a charcoal
 ```
 
 Adjust the values of X, Y and Z for your environment. Typically, X=10, Y=2 and Z=1 works fine on 
