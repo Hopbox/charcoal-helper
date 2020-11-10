@@ -96,6 +96,8 @@ ALIX and Routerboard with around 10 machines in the network.
 
 In order to obtain API key, kindly write to [charcoal@hopbox.in](mailto:charcoal@hopbox.in)
 
+Alternatively, self-host charcoal server - https://github.com/hopbox/charcoal/
+
 ## Managing the ACL rules
 
 Head to [active.charcoal.io](https://active.charcoal.io) and login with the credentials provided with the API key.
