@@ -71,8 +71,7 @@ Connection closed by foreign host.
 
 ## Squid Versions supported
 
-Squid-2.x is supported in compatibility mode with `-c` argument to the helper. While Squid-3.x is supported natively.
-We will add support for Squid-4.x soon.
+Squid-2.x is supported in compatibility mode with `-c` argument to the helper. While Squid-3.x and Squid-4.x are supported natively.
 
 ## Setup and Configuration
 Add following lines to `squid.conf`:
