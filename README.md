@@ -99,4 +99,4 @@ Alternatively, self-host charcoal server - https://github.com/hopbox/charcoal/
 
 ## Managing the ACL rules
 
-Head to [active.charcoal.io](https://active.charcoal.io) and login with the credentials provided with the API key.
+Head to [my.charcoal.io](https://my.charcoal.io) and login with the credentials provided with the API key.
