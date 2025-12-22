@@ -1,7 +1,8 @@
 #!/usr/bin/perl -s
 #
-# Charcoal - URL Re-Director/Re-writer for Squid
-# Copyright (C) 2012 Unmukti Technology Pvt Ltd <info@unmukti.in>
+# Charcoal - External ACL helper for squid
+# Usage: ./charcoal-helper-ext.pl [-cdh] <api-key>
+# Copyright (C) 2012-2025 Unmukti Technology Pvt Ltd <info@unmukti.in>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -17,226 +18,223 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
 
+use strict;
+use warnings;
+use vars qw($h $d $c $f); # -h (help), -d (debug), -c (compat), -f (fail-mode)
 use IO::Socket;
+use IO::Select;
+use Time::HiRes qw(time);
 
-$|=1; #Flush after write
+$| = 1; 
 
-my $DEBUG = 1 if $d;
-my $squidver = 3;
-$squidver = 2 if $c;
-
-# ARGUMENTS REQUIRED
-# 1. API Key
-
-if ($h){
-	print STDERR "Usage:\t$0 [-cdh] <api-key>\n";
-	print STDERR "\t$0 -c -d <api-key>\t: send debug messages to STDERR\n";
-	print STDERR "\t$0 -h\t\t\t: print this message\n";
-	print STDERR "\t$0 -c\t\t\t: run helper in Squid 2.x compatibility mode.\n";
-	exit 0;
+# --- ARGUMENTS & HELP LOGIC ---
+if ($h) {
+    print STDERR "Usage:\t$0 [-cdfh] <api-key>\n";
+    print STDERR "\t$0 -c -d <api-key>\t: debug to STDERR\n";
+    print STDERR "\t$0 -f=ERR <api-key>\t: Fail-Closed (block on server error)\n";
+    print STDERR "\t$0 -f=OK <api-key>\t: Fail-Open (allow on server error)\n";
+    print STDERR "\t$0 -h\t\t\t: print this message\n";
+    print STDERR "\t$0 -h\t\t\t: print help\n";
+    print STDERR "\t$0 -c\t\t\t: Squid 2.x mode\n";
+    exit 0;
 }
 
-if ( @ARGV < 1){
-	print STDERR "BH message=\"Usage: $0 -[cdh] <api-key>\"\n";
-	exit 1;
+my $apikey_arg = @ARGV ? shift @ARGV : undef;
+my $squidver_arg = $c ? 2 : undef;
+
+# --- SIGNAL HANDLING ---
+$SIG{TERM} = $SIG{INT} = sub { exit(0); };
+
+# --- UNIVERSAL CONFIG LOADER ---
+my %CONFIG;
+sub load_config {
+    my $uci_bin = `which uci 2>/dev/null`;
+    if ($uci_bin) {
+        $CONFIG{server}  = `uci -q get charcoal.main.server`  || 'active.charcoal.io';
+        $CONFIG{port}    = `uci -q get charcoal.main.port`    || '6603';
+        $CONFIG{api_key} = `uci -q get charcoal.main.api_key` || 'MISSING_KEY';
+        $CONFIG{ver}     = `uci -q get charcoal.main.squid_version` || '3';
+        $CONFIG{debug}   = `uci -q get charcoal.main.debug`   || 0;
+        $CONFIG{max_retries} = `uci -q get charcoal.main.max_retries` || 2;
+        $CONFIG{timeout} = `uci -q get charcoal.main.timeout` || 2;
+        $CONFIG{default_reply} = `uci -q get charcoal.main.default_reply` || 'OK';
+    } else {
+        my $file = -e "/etc/charcoal.conf" ? "/etc/charcoal.conf" : "./charcoal.conf";
+        if (open(my $fh, '<', $file)) {
+            while (<$fh>) {
+                chomp; next if /^\s*#/ || /^\s*$/;
+                my ($k, $v) = split(/\s*=\s*/, $_, 2);
+                $CONFIG{$k} = $v if $k;
+            }
+            close($fh);
+        }
+    }
+    foreach (keys %CONFIG) { chomp $CONFIG{$_} if defined $CONFIG{$_}; $CONFIG{$_} =~ s/\s+//g if $CONFIG{$_}; }
 }
 
+load_config();
 
-#########
-## Server: charcoal.hopbox.in
-## Port  : 80
-## Uncomment server closest to your location - India, EU, US
+# --- VARIABLE ASSIGNMENT ---
+my $DEBUG = $d || $CONFIG{debug} || 0;
+my $squidver = $c ? 2 : ($CONFIG{ver} || 3);
+my $apikey = $apikey_arg || $CONFIG{api_key} || 'MISSING_KEY';
+my $charcoal_server = $CONFIG{server} || 'active.charcoal.io';
+my $charcoal_port   = $CONFIG{port}   || '6603';
+my $max_retries     = $CONFIG{max_retries} || 2;
+my $timeout         = $CONFIG{timeout} || 3;
+my $default_reply   = $f || $CONFIG{default_reply} || 'OK'; # OK = Fail-Open, ERR = Fail-Closed
 
-# Servers for India
-my $charcoal_server = 'active.charcoal.io';
-
-# Servers for EU
-#my $charcoal_server = 'eu.active.charcoal.io';
-
-# Server for US
-#my $charcoal_server = 'us.active.charcoal.io';
-
-my $charcoal_port   = '6603';
-my $proto           = 'tcp';
-my $timeout         = 10;
-
-my $apikey = shift @ARGV;
-
-print STDERR "Received API KEY $apikey\n";
-print STDERR "Running for Squid Version $squidver\n";
-
-
-#For each requested URL, the rewriter will receive on line with the format
-#
-#	  [channel-ID <SP>] URL [<SP> extras]<NL>
-#
-#	See url_rewrite_extras on how to send "extras" with optional values to
-#	the helper.
-#	After processing the request the helper must reply using the following format:
-#
-#	  [channel-ID <SP>] result [<SP> kv-pairs]
-#
-#	The result code can be:
-#
-#	  OK status=30N url="..."
-#		Redirect the URL to the one supplied in 'url='.
-#		'status=' is optional and contains the status code to send
-#		the client in Squids HTTP response. It must be one of the
-#		HTTP redirect status codes: 301, 302, 303, 307, 308.
-#		When no status is given Squid will use 302.
-#
-#	  OK rewrite-url="..."
-#		Rewrite the URL to the one supplied in 'rewrite-url='.
-#		The new URL is fetched directly by Squid and returned to
-#		the client as the response to its request.
-#
-#	  OK
-#		When neither of url= and rewrite-url= are sent Squid does
-#		not change the URL.
-#
-#	  ERR
-#		Do not change the URL.
-#
-#	  BH
-#		An internal error occurred in the helper, preventing
-#		a result being identified. The 'message=' key name is
-#		reserved for delivering a log message.
-#
-
-
-$SIG{PIPE} = sub {
-				print STDERR "ERROR: Charcoal: Lost connection to server: $!\n";
-				print "BH message=\"Charcoal: Lost connection to server: $!\"\n";
-				return 1;
-			};
-
-my $socket = new_socket();
-
-while(<>){
-
-	chomp;
-
-	print STDERR "RAW: $_\n" if $DEBUG;
-
-	my @chunks = split(/\s+/);
-
-	print STDERR scalar(@chunks) . " chunks received \n" if $DEBUG;
-
-	next if scalar @chunks == 0;
-
-	$socket = new_socket() if (!$socket->connected());
-
-	if ($chunks[0] =~ m/^\d+/){
-	### Concurrency enabled
-		print STDERR "Concurrency Enabled\n" if $DEBUG;
-		my ($chan, $url, $clientip, $ident, $method, $blah, $proxyip, $proxyport) = split(/\s+/);
-		my $query = "$apikey|$squidver|$clientip|$ident|$method|$blah|$url";
-		my $access = get_access($query);
-		
-		if ($squidver == 2){
-			if ($access =~ /Timed Out/ or $access eq "\r\n")  {
-				print STDERR "WARNING: Charcoal Server connection closed. Reattempting query.\n";
-				$socket = new_socket();
-				$access = get_access($query);
-				if ($access =~ /Timed Out/) {
-					print STDERR "ERROR: Charcoal: Server connection closed again.\n";
-					print STDOUT "BH message=\"Charcoal: Server connection closed while querying. Giving up on this query.\"\n";
-					next;
-				}
-			}
-		}
-		else {
-			if ($access =~ /Timed Out/ or !$access) {
-				print STDERR "WARNING: Charcoal Server connection closed. Reattempting query.\n";
-				$socket = new_socket();
-				$access = get_access($query);
-				if ($access =~ /Timed Out/ or !$access or $access eq "\r\n") {
-					print STDERR "ERROR: Charcoal: Server connection closed again.\n";
-					print STDOUT "BH message=\"Charcoal: Server connection closed while querying. Giving up on this query.\"\n";
-					next;
-				}
-			}
-
-		}
-
-		chomp $access;
-
-		$access = "ERR message=NOTALLOWED" if ($access =~ /status=/);
-
-		my $res = $chan . ' ' . $access;
-		print STDOUT "$res\n";
-		print STDERR "$res\n" if $DEBUG;
-		next;
-	}
-
-	else {
-	### Concurrency disabled
-		print STDERR "Concurrency Disabled\n" if $DEBUG;
-		my ($url, $clientip, $ident, $method, $blah, $proxyip, $proxyport) = split(/\s+/);
-		my $query = "$apikey|$squidver|$clientip|$ident|$method|$blah|$url";
-		my $access = get_access($query);
-
-		if ($squidver == 2){
-			if ($access =~ /Timed Out/ or $access eq "\r\n")  {
-				print STDERR "WARNING: Charcoal Server connection closed. Reattempting query.\n";
-				$socket = new_socket();
-				$access = get_access($query);
-				if ($access =~ /Timed Out/) {
-					print STDERR "ERROR: Charcoal: Server connection closed again.\n";
-					print STDOUT "BH message=\"Charcoal: Server connection closed while querying. Giving up on this query.\"\n";
-					next;
-				}
-			}
-		}
-		else {
-			if ($access =~ /Timed Out/ or !$access) {
-				print STDERR "WARNING: Charcoal Server connection closed. Reattempting query.\n";
-				$socket = new_socket();
-				$access = get_access($query);
-				if ($access =~ /Timed Out/ or !$access) {
-					print STDERR "ERROR: Charcoal: Server connection closed again.\n";
-					print STDOUT "BH message=\"Charcoal: Server connection closed while querying. Giving up on this query.\"\n";
-					next;
-				}
-			}
-		}
-
-		chomp $access;
-
-		$access = "ERR message=NOTALLOWED" if ($access =~ /status=/);
-
-		my $res = $access;
-		print STDOUT "$res\n";
-		print STDERR "$res\n" if $DEBUG;
-		next;
-	}
-
+sub log_debug {
+    return unless $DEBUG;
+    my ($sec,$min,$hour,$mday,$mon,$year) = localtime();
+    printf STDERR "[%04d-%02d-%02d %02d:%02d:%02d] Charcoal: %s\n", 
+        $year+1900, $mon+1, $mday, $hour, $min, $sec, shift;
 }
 
-sub get_access {
-	my $query = shift;
-	print STDERR "Charcoal: Sending $query\n" if $DEBUG;
-	print $socket "$query\r\n";
-	my $access = <$socket>;
-	print STDERR "Charcoal: get_access ACCESS: $access\n" if $DEBUG;
-	return $access;
+log_debug("Started. Server: $charcoal_server, API: $apikey, Fail-Mode: $default_reply, Squid Ver: $squidver");
+
+# --- MAIN LOOP & LOGIC ---
+my $socket          = undef;
+my $sel             = IO::Select->new(\*STDIN);
+my @queue           = ();    
+my %pending_queries = ( fifo => [] ); 
+my $connect_start   = 0;
+my $last_retry      = 0;
+
+while (1) {
+    my $now = time();
+
+    # 1. Lazy Connection Management
+    # Only try to connect if we have no socket AND there is work to do
+    if (!$socket && @queue) {
+        if ($now - $last_retry > 1) { 
+            $last_retry = $now;
+            log_debug("Requests waiting. Attempting to connect to $charcoal_server...");
+            
+            $socket = IO::Socket::INET->new(
+                PeerAddr => $charcoal_server, PeerPort => $charcoal_port,
+                Proto => 'tcp', Blocking => 0, Timeout => 2
+            );
+            
+            if ($socket) {
+                $sel->add($socket);
+                $connect_start = 0; # Reset connection timer
+                log_debug("Connected to node: " . ($socket->peerhost() || "unknown"));
+            } else {
+                # Mark when we started failing to connect to enforce the timeout
+                $connect_start = $now if !$connect_start;
+                log_debug("Connection failed. Will retry...");
+            }
+        }
+    }
+
+    # 2. Check for Fail-Safe (Timeout handling)
+    my $waiting_since = 0;
+    if (!$socket && $connect_start > 0) { 
+        $waiting_since = $connect_start; 
+    } elsif (@{$pending_queries{fifo}}) { 
+        $waiting_since = $pending_queries{fifo}[0]{sent_at}; 
+    }
+
+    if ($waiting_since > 0 && ($now - $waiting_since > $timeout)) {
+        if (!$socket) {
+            log_debug("Could not connect within $timeout seconds. Flushing queue with $default_reply.");
+            while (my $item = shift @queue) { send_to_squid($item->{chan}, $default_reply); }
+            $connect_start = 0;
+        } else {
+            close_socket("In-flight response timeout");
+        }
+    }
+
+    # 3. I/O Multiplexing (Wait for Squid or Server)
+    my @ready = $sel->can_read(0.1); 
+    foreach my $fh (@ready) {
+        if ($fh == \*STDIN) { 
+            exit(0) unless handle_stdin(); # This adds to @queue
+        }
+        elsif ($socket && $fh == $socket) { 
+            handle_socket_read(); 
+        }
+    }
+
+    # 4. Sending Data
+    if ($socket && $socket->connected && @queue) {
+        while (my $item = shift @queue) {
+            log_debug("Sending to server - payload: $item->{payload}");
+            $item->{sent_at} = time(); 
+            print $socket $item->{payload} . "\r\n";
+            push @{$pending_queries{fifo}}, $item;
+        }
+    }
 }
 
-sub new_socket {
-	my $sock = IO::Socket::INET->new(PeerAddr  => $charcoal_server,
-			PeerPort   => $charcoal_port,
-			Proto	   => $proto,
-			Timeout	   => $timeout,
-			Type	   => SOCK_STREAM,
-		);
+sub handle_stdin {
+    my $line = <STDIN>;
+    return 0 unless defined $line;
+    chomp $line;
+    my @chunks = split(/\s+/, $line);
+    return 1 if !@chunks;
 
-	if (!$sock) {
-		print STDOUT "BH message=\"Charcoal: Error connecting to server. $!\"\n";
-		print STDERR "FATAL: Charcoal: Error connecting to server. $!\n"; 
-		die;
-	}
+    my ($chan, $url, $cip, $id, $meth, $blah);
+    if ($chunks[0] =~ /^\d+$/) { ($chan, $url, $cip, $id, $meth, $blah) = @chunks; }
+    else { $chan = ""; ($url, $cip, $id, $meth, $blah) = @chunks; }
+    
+    my $payload = join('|', $apikey, $squidver, ($cip||"-"), ($id||"-"), ($meth||"-"), ($blah||"-"), ($url||"-"));
+    push @queue, { chan => $chan, payload => $payload, retries => 0 };
+    return 1;
+}
 
-	print STDERR "Charcoal: Connected to $charcoal_server on $proto port $charcoal_port.\n" if $DEBUG;
+sub handle_socket_read {
+    my $response = <$socket>;
+    if (!defined $response) { close_socket("Socket EOF"); return; }
+    
+    $response =~ s/^\s+|\s+$//g; 
+    return if $response eq "";
 
-	return $sock;
+    log_debug("Received from server - response: $response");
+    
+    if ($response =~ /Timed Out/i) {
+        close_socket("Server-side Internal Timeout");
+        return;
+    }
+
+    my $current_item = shift @{$pending_queries{fifo}};
+    return unless $current_item;
+
+    $response = "ERR message=NOTALLOWED" if ($response =~ /status=/);
+    send_to_squid($current_item->{chan}, $response);
+}
+
+sub retry_or_fail {
+    my ($item) = @_;
+    $item->{retries}++;
+    if ($item->{retries} < $max_retries) {
+		log_debug("Retrying Chan: $item->{chan} (Attempt $item->{retries}/$max_retries)");        
+		unshift @queue, $item; 
+    } else { 
+        log_debug("Max retries reached for Chan: $item->{chan}. Sending $default_reply.");
+        send_to_squid($item->{chan}, $default_reply); 
+    }
+}
+
+sub send_to_squid {
+    my ($chan, $msg) = @_;
+    my $out = ($chan ne "") ? "$chan $msg" : ($msg || $default_reply);
+    print STDOUT "$out\n";
+}
+
+sub close_socket {
+    return unless $socket;
+    log_debug("Closing socket: " . ($_[0] || "Unknown"));
+    $sel->remove($socket); 
+    $socket->close(); 
+    $socket = undef;
+
+    # Reset retry timer to allow immediate reconnection attempt
+    $last_retry = 0; 
+
+    # Move all pending requests back to the main queue
+    my $inflight = $pending_queries{fifo}; 
+    $pending_queries{fifo} = [];
+    foreach my $item (@$inflight) { retry_or_fail($item); }
 }
