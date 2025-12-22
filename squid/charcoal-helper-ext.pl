@@ -122,6 +122,8 @@ while(<>){
 
 	print STDERR scalar(@chunks) . " chunks received \n" if $DEBUG;
 
+	next if scalar @chunks == 0;
+
 	$socket = new_socket() if (!$socket->connected());
 
 	if ($chunks[0] =~ m/^\d+/){
@@ -132,7 +134,7 @@ while(<>){
 		my $access = get_access($query);
 		
 		if ($squidver == 2){
-			if ($access =~ /Timed Out/)  {
+			if ($access =~ /Timed Out/ or $access eq "\r\n")  {
 				print STDERR "WARNING: Charcoal Server connection closed. Reattempting query.\n";
 				$socket = new_socket();
 				$access = get_access($query);
@@ -144,7 +146,7 @@ while(<>){
 			}
 		}
 		else {
-			if ($access =~ /Timed Out/ or !$access or $access eq "\r\n") {
+			if ($access =~ /Timed Out/ or !$access) {
 				print STDERR "WARNING: Charcoal Server connection closed. Reattempting query.\n";
 				$socket = new_socket();
 				$access = get_access($query);
@@ -175,7 +177,7 @@ while(<>){
 		my $access = get_access($query);
 
 		if ($squidver == 2){
-			if ($access =~ /Timed Out/)  {
+			if ($access =~ /Timed Out/ or $access eq "\r\n")  {
 				print STDERR "WARNING: Charcoal Server connection closed. Reattempting query.\n";
 				$socket = new_socket();
 				$access = get_access($query);
@@ -187,11 +189,11 @@ while(<>){
 			}
 		}
 		else {
-			if ($access =~ /Timed Out/ or !$access or $access eq "\r\n") {
+			if ($access =~ /Timed Out/ or !$access) {
 				print STDERR "WARNING: Charcoal Server connection closed. Reattempting query.\n";
 				$socket = new_socket();
 				$access = get_access($query);
-				if ($access =~ /Timed Out/ or !$access or $access eq "\r\n") {
+				if ($access =~ /Timed Out/ or !$access) {
 					print STDERR "ERROR: Charcoal: Server connection closed again.\n";
 					print STDOUT "BH message=\"Charcoal: Server connection closed while querying. Giving up on this query.\"\n";
 					next;
@@ -206,6 +208,7 @@ while(<>){
 		my $res = $access;
 		print STDOUT "$res\n";
 		print STDERR "$res\n" if $DEBUG;
+		next;
 	}
 
 }
