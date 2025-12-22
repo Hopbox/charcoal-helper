@@ -25,7 +25,7 @@ It can run on any POSIX compliant Unix system which has:
     - Cache:Memcached on OpenWrt
 
 ## Memcached Support
-A local memcached server is required on Squid machine. `Cache::Memcached::Fast` module is required to use memcached. The helper file with memcached support is `charcoal-helper-memcached.pl`.
+A local memcached server is suggested on Squid machine. `Cache::Memcached::Fast` module is required to use memcached. Helper files with `-memcached` in the names use memcached, if available.
 
 Default time for caching the results is 60 seconds.
 
@@ -71,24 +71,31 @@ Connection closed by foreign host.
 
 ## Squid Versions supported
 
-Squid-2.x is supported in compatibility mode with `-c` argument to the helper. While Squid-3.x is supported natively.
-We will add support for Squid-4.x soon.
+* Squid-2.x is supported in compatibility mode with `-c` argument to the helper. 
+* Squid > 3.x are supported natively as external acl helper.
 
 ## Setup and Configuration
 Add following lines to `squid.conf`:
 
-```
-url_rewrite_program /path/to/charcoal-helper.pl YOUR_API_KEY
-url_rewrite_children X startup=Y idle=Z concurrency=1
-```
-
 Configuration as External ACL Helper:
 
 ```
-external_acl_type charcoal_helper ttl=60 negative_ttl=60 children-max=25 children-startup=5 children-idle=2 concurrency=10 %URI %SRC %IDENT %METHOD %% %MYADDR %MYPORT /etc/config/squid-helpers/charcoal-helper-ext-memcached.pl <API_KEY>
+http_access deny !safe_ports
+http_access deny connect !ssl_ports
+
+external_acl_type charcoal_helper ttl=60 negative_ttl=60 children-max=X children-startup=Y children-idle=Z concurrency=10 %URI %SRC %IDENT %METHOD %% %MYADDR %MYPORT /etc/config/squid-helpers/charcoal-helper-ext-memcached.pl <API_KEY>
 acl charcoal external charcoal_helper
 http_access deny !charcoal
-#deny_info http://your-deny-domain/cgi-bin/blockmsg.cgi?url=%u&clientaddr=%i&clientuser=%a charcoal
+
+http_access allow localhost manager
+http_access deny manager
+```
+
+Configuration as URL Rewrite Program **not recommended**:
+
+```
+url_rewrite_program /path/to/charcoal-helper.pl YOUR_API_KEY
+url_rewrite_children X startup=Y idle=Z concurrency=1
 ```
 
 Adjust the values of X, Y and Z for your environment. Typically, X=10, Y=2 and Z=1 works fine on 
@@ -96,6 +103,8 @@ ALIX and Routerboard with around 10 machines in the network.
 
 In order to obtain API key, kindly write to [charcoal@hopbox.in](mailto:charcoal@hopbox.in)
 
+Alternatively, self-host charcoal server - https://github.com/hopbox/charcoal/
+
 ## Managing the ACL rules
 
-Head to [active.charcoal.io](https://active.charcoal.io) and login with the credentials provided with the API key.
+Head to [my.charcoal.io](https://my.charcoal.io) and login with the credentials provided with the API key.
