@@ -1,12 +1,18 @@
 * **charcoal-helper-ext.pl: Update for reliability and stability**
     
 It now handles both network issues and server-side timeouts gracefully.
+
+Loads config from /etc/charcoal.conf (non-OpenWrt) and /etc/config/charcoal (OpenWrt).
+
+Drop-in replacement for current squid.conf configuration line with API_KEY provided.
     
 * The script now follows this high-level logic for maximum reliability:
 
 1. **Queueing**: Every request from Squid is assigned a Channel ID and placed in a Main Queue.
 1. **Multiplexing**: It monitors both Squid (STDIN) and the Filtering Server (Socket) simultaneously using IO::Select.
 1. **In-Flight Tracking**: Once a request is sent, it moves to a FIFO (First-In-First-Out) Pending List with a timestamp.
+1. **Socket Buffer Draining**: Speed up is signficant due to change that doesn't wait for 0.1 seconds before checking if socket is available for read. It drains the socket complete on read.
+1. **Slow Response Logging**: Logs slow response to syslog and STDERR. Default value for `slow_threshold` is `0.1 (100ms)`.
 1. **Error Recovery**: 
 - If the server sends "Timed Out.", the script closes the socket and moves all pending requests back to the Main Queue.
 - If the server is silent for too long (In-flight timeout), the script forces a reconnection.

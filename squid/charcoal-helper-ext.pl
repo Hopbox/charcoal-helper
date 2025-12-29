@@ -20,15 +20,18 @@
 
 use strict;
 use warnings;
+our $VERSION = '1.2.0';
 use vars qw($h $d $c $f); # -h (help), -d (debug), -c (compat), -f (fail-mode)
 use IO::Socket;
 use IO::Select;
 use Time::HiRes qw(time);
+use Socket;
 
 $| = 1; 
 
 # --- ARGUMENTS & HELP LOGIC ---
 if ($h) {
+    print STDERR "Charcoal External ACL Helper (Perl) v$VERSION\n";
     print STDERR "Usage:\t$0 [-cdfh] <api-key>\n";
     print STDERR "\t$0 -c -d <api-key>\t: debug to STDERR\n";
     print STDERR "\t$0 -f=ERR <api-key>\t: Fail-Closed (block on server error)\n";
@@ -57,6 +60,7 @@ sub load_config {
         $CONFIG{debug}   = `uci -q get charcoal.main.debug`   || 0;
         $CONFIG{max_retries} = `uci -q get charcoal.main.max_retries` || 2;
         $CONFIG{timeout} = `uci -q get charcoal.main.timeout` || 2;
+        $CONFIG{slow_threshold} = `uci -q get charcoal.main.slow_threshold` || 0.1;
         $CONFIG{default_reply} = `uci -q get charcoal.main.default_reply` || 'OK';
     } else {
         my $file = -e "/etc/charcoal.conf" ? "/etc/charcoal.conf" : "./charcoal.conf";
@@ -83,15 +87,49 @@ my $charcoal_port   = $CONFIG{port}   || '6603';
 my $max_retries     = $CONFIG{max_retries} || 2;
 my $timeout         = $CONFIG{timeout} || 3;
 my $default_reply   = $f || $CONFIG{default_reply} || 'OK'; # OK = Fail-Open, ERR = Fail-Closed
+$CONFIG{current_peer} = "none";
+$CONFIG{conn_established} = undef;
+
+# Pre-connect to the local log socket
+my $LOG_SOCK_PATH = '/dev/log';
+socket(my $lp, PF_UNIX, SOCK_DGRAM, 0);
+my $log_dest = sockaddr_un($LOG_SOCK_PATH);
+
+sub log_warn {
+    my ($msg, $latency, $chan) = @_;
+    my $now = time();
+    
+    # Calculate connection age
+    my $conn_age = defined $CONFIG{conn_established} ? int($now - $CONFIG{conn_established}) : 0;
+    my $peer = $CONFIG{current_peer} || "none";
+
+    # 1. Local terminal log (STDERR) with millisecond precision
+    my ($sec,$min,$hour,$mday,$mon,$year) = localtime();
+    my $ms = sprintf("%03d", ($now - int($now)) * 1000);
+    printf STDERR "[%04d-%02d-%02d %02d:%02d:%02d.%s] Charcoal: !!! SLOW [%s] Latency: %.4fs Age: %ds Peer: %s !!!\n", 
+        $year+1900, $mon+1, $mday, $hour, $min, $sec, $ms, ($chan // '0'), $latency, $conn_age, $peer;
+
+    # 2. Remote telemetry log (/dev/log) - Quoted strings, unquoted numbers
+    my $pri = 28; # daemon.warn
+    my $structured = sprintf("<%d>charcoal-helper: v=\"%s\" msg=\"%s\" latency=%.4f chan=%s server=\"%s\" conn_age=%d", 
+                             $pri, $VERSION, $msg, $latency, ($chan // 0), $peer, $conn_age);
+
+    send($lp, $structured, 0, $log_dest);
+}
 
 sub log_debug {
     return unless $DEBUG;
     my ($sec,$min,$hour,$mday,$mon,$year) = localtime();
-    printf STDERR "[%04d-%02d-%02d %02d:%02d:%02d] Charcoal: %s\n", 
-        $year+1900, $mon+1, $mday, $hour, $min, $sec, shift;
+    # Use Time::HiRes::time() for fractional seconds
+    my $now = time();
+    my $ms = sprintf("%03d", ($now - int($now)) * 1000);
+    
+    printf STDERR "[%04d-%02d-%02d %02d:%02d:%02d.%s] Charcoal: %s\n", 
+        $year+1900, $mon+1, $mday, $hour, $min, $sec, $ms, shift;
 }
 
-log_debug("Started. Server: $charcoal_server, API: $apikey, Fail-Mode: $default_reply, Squid Ver: $squidver");
+
+log_debug("Started v$VERSION. Server: $charcoal_server, API: $apikey, Fail-Mode: $default_reply, Squid Ver: $squidver");
 
 # --- MAIN LOOP & LOGIC ---
 my $socket          = undef;
@@ -119,7 +157,9 @@ while (1) {
             if ($socket) {
                 $sel->add($socket);
                 $connect_start = 0; # Reset connection timer
-                log_debug("Connected to node: " . ($socket->peerhost() || "unknown"));
+                $CONFIG{current_peer} = $socket->peerhost() || $charcoal_server;
+                $CONFIG{conn_established} = time(); # NEW: Track start time
+                log_debug("Connected to node: $CONFIG{current_peer}");
             } else {
                 # Mark when we started failing to connect to enforce the timeout
                 $connect_start = $now if !$connect_start;
@@ -185,24 +225,44 @@ sub handle_stdin {
 }
 
 sub handle_socket_read {
-    my $response = <$socket>;
-    if (!defined $response) { close_socket("Socket EOF"); return; }
-    
-    $response =~ s/^\s+|\s+$//g; 
-    return if $response eq "";
+    # Read as many lines as are available in the current TCP buffer
+    while (my $response = <$socket>) {
+        my $recv_time = time(); # Capture high-res time immediately upon read
+        
+        $response =~ s/^\s+|\s+$//g;
+        next if $response eq "";
 
-    log_debug("Received from server - response: $response");
-    
-    if ($response =~ /Timed Out/i) {
-        close_socket("Server-side Internal Timeout");
-        return;
+        if ($response =~ /Timed Out/i) {
+            close_socket("Server-side Internal Timeout");
+            return;
+        }
+
+        # Match response to the oldest pending query
+        my $current_item = shift @{$pending_queries{fifo}};
+        
+        if ($current_item) {
+            # Calculate Latency: recv_time - sent_at
+            my $latency = $recv_time - $current_item->{sent_at};
+            # Slow Response Trigger (Threshold: 100ms)
+            if ($latency > $CONFIG{slow_threshold}) {
+                log_warn("slow_response", $latency, $current_item->{chan});
+            }
+            
+            # Enhanced log showing latency and channel ID
+            log_debug(sprintf("Received [Chan: %s] Latency: %.4fs - Response: %s", 
+                ($current_item->{chan} // "none"), $latency, $response));
+
+            # Handle the 307 redirect logic
+            my $final_reply = ($response =~ /status=/) ? "ERR message=NOTALLOWED" : $response;
+            send_to_squid($current_item->{chan}, $final_reply);
+        } else {
+            # Safety log for unexpected server data
+            log_debug("Received unsolicited response from server: $response");
+        }
+
+        # The secret sauce: drain the buffer if more lines are waiting
+        last unless $socket->atmark || $sel->can_read(0);
     }
-
-    my $current_item = shift @{$pending_queries{fifo}};
-    return unless $current_item;
-
-    $response = "ERR message=NOTALLOWED" if ($response =~ /status=/);
-    send_to_squid($current_item->{chan}, $response);
 }
 
 sub retry_or_fail {
@@ -237,4 +297,7 @@ sub close_socket {
     my $inflight = $pending_queries{fifo}; 
     $pending_queries{fifo} = [];
     foreach my $item (@$inflight) { retry_or_fail($item); }
+    
+    $CONFIG{conn_established} = undef; # Reset timer for next connection
+    $CONFIG{current_peer} = "none";
 }

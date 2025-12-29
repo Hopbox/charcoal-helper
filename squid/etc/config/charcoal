@@ -1,6 +1,6 @@
 config charcoal 'main'
     option api_key 'YOUR_API_KEY'
-    option server '127.0.0.1'
+    option server 'active.charcoal.io'
     option port '6603'
     option squid_version '3'
     option debug '0'
