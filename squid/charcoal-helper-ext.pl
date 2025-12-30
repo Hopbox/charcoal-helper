@@ -20,7 +20,7 @@
 
 use strict;
 use warnings;
-our $VERSION = '1.2.0';
+our $VERSION = '1.2.1';
 use vars qw($h $d $c $f); # -h (help), -d (debug), -c (compat), -f (fail-mode)
 use IO::Socket;
 use IO::Select;
@@ -97,6 +97,7 @@ my $log_dest = sockaddr_un($LOG_SOCK_PATH);
 
 sub log_warn {
     my ($msg, $latency, $chan) = @_;
+    $latency //= 0; # THE FIX: Default to 0 if undefined
     my $now = time();
     
     # Calculate connection age
@@ -138,6 +139,7 @@ my @queue           = ();
 my %pending_queries = ( fifo => [] ); 
 my $connect_start   = 0;
 my $last_retry      = 0;
+my $socket_buf      = '';
 
 while (1) {
     my $now = time();
@@ -225,10 +227,30 @@ sub handle_stdin {
 }
 
 sub handle_socket_read {
-    # Read as many lines as are available in the current TCP buffer
-    while (my $response = <$socket>) {
-        my $recv_time = time(); # Capture high-res time immediately upon read
-        
+    return unless (defined $socket && $socket->opened);
+    
+    my $data;
+    my $rv = sysread($socket, $data, 8192);
+
+    if (!defined($rv)) {
+        # Check if it's just a "no data yet" error
+        if ($!{EAGAIN} || $!{EWOULDBLOCK}) {
+            return; # Do nothing, just go back to the main loop
+        } else {
+            close_socket("Socket read error: $!");
+            return;
+        }
+    } elsif ($rv == 0) {
+        close_socket("Remote server closed connection (EOF)");
+        return;
+    }
+
+    # Append new data to our persistent buffer
+    $socket_buf .= $data;
+
+    # Process every complete line in the buffer
+    while ($socket_buf =~ s/^(.*?)[\r\n]+//) {
+        my $response = $1;
         $response =~ s/^\s+|\s+$//g;
         next if $response eq "";
 
@@ -237,31 +259,21 @@ sub handle_socket_read {
             return;
         }
 
-        # Match response to the oldest pending query
         my $current_item = shift @{$pending_queries{fifo}};
-        
         if ($current_item) {
-            # Calculate Latency: recv_time - sent_at
+            my $recv_time = time();
             my $latency = $recv_time - $current_item->{sent_at};
-            # Slow Response Trigger (Threshold: 100ms)
+            
             if ($latency > $CONFIG{slow_threshold}) {
                 log_warn("slow_response", $latency, $current_item->{chan});
             }
             
-            # Enhanced log showing latency and channel ID
             log_debug(sprintf("Received [Chan: %s] Latency: %.4fs - Response: %s", 
                 ($current_item->{chan} // "none"), $latency, $response));
 
-            # Handle the 307 redirect logic
             my $final_reply = ($response =~ /status=/) ? "ERR message=NOTALLOWED" : $response;
             send_to_squid($current_item->{chan}, $final_reply);
-        } else {
-            # Safety log for unexpected server data
-            log_debug("Received unsolicited response from server: $response");
         }
-
-        # The secret sauce: drain the buffer if more lines are waiting
-        last unless $socket->atmark || $sel->can_read(0);
     }
 }
 
@@ -285,13 +297,14 @@ sub send_to_squid {
 
 sub close_socket {
     return unless $socket;
-    log_debug("Closing socket: " . ($_[0] || "Unknown"));
+    log_warn("socket_closed_" . ($_[0] || "unknown"), 0, "sys");
     $sel->remove($socket); 
     $socket->close(); 
     $socket = undef;
+    $socket_buf = '';
 
     # Reset retry timer to allow immediate reconnection attempt
-    $last_retry = 0; 
+    $last_retry = time(); 
 
     # Move all pending requests back to the main queue
     my $inflight = $pending_queries{fifo}; 
