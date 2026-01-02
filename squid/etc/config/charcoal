@@ -1,10 +1,44 @@
-config charcoal 'main'
-    option api_key 'YOUR_API_KEY'
+package charcoal
+
+config main 'main'
+    # --- GLOBAL CONNECTION SETTINGS ---
     option server 'active.charcoal.io'
     option port '6603'
+    option api_key 'YOUR_API_KEY_HERE'
+    
+    # --- ENGINE & VERSIONING ---
+    # squid_version '2' for legacy, '3' for modern
     option squid_version '3'
     option debug '0'
+
+    # --- PERFORMANCE & TIMEOUTS ---
+    # timeout: Seconds to wait for server before fail-over
+    # slow_threshold: Latency (in seconds) that triggers a 'SLOW' warning in logs
+    option timeout '2'
     option max_retries '2'
-    option timeout '3'
     option slow_threshold '0.1'
+    
+    # --- FAIL-SAFE MODE ---
+    # OK  = Fail-Open (Allow traffic if server is down)
+    # ERR = Fail-Closed (Block traffic if server is down)
     option default_reply 'OK'
+
+    # --- TLS / SSL OPTIMIZATION ---
+    option use_tls '1'
+    option tls_verify '1'
+
+    # CIPHER SELECTION LOGIC:
+    # -------------------------------------------------------------------------
+    # MIPS (MT7621/RB750Gr3): Use ChaCha20 strings for software efficiency.
+    # x86 (AES-NI): Use AES-GCM strings for hardware acceleration.
+    # -------------------------------------------------------------------------
+
+    # TLS 1.3 Suites (Used if server negotiates TLS 1.3)
+    # MIPS Value: 'TLS_CHACHA20_POLY1305_SHA256'
+    # x86 Value:  'TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384'
+    option tls_ciphersuites 'TLS_CHACHA20_POLY1305_SHA256'
+
+    # TLS 1.2 Cipher List (Used if server negotiates TLS 1.2 or below)
+    # MIPS Value: 'ECDHE-RSA-CHACHA20-POLY1305'
+    # x86 Value:  'ECDHE-RSA-AES128-GCM-SHA256:HIGH:!aNULL:!MD5'
+    option tls_cipher_list 'ECDHE-RSA-CHACHA20-POLY1305'
