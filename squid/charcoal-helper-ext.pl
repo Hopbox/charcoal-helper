@@ -12,7 +12,7 @@
 
 use strict;
 use warnings;
-our $VERSION = '1.2.2';
+our $VERSION = '1.2.3';
 use vars qw($h $d $c $f); # -h (help), -d (debug), -c (compat), -f (fail-mode)
 use IO::Socket;
 use IO::Select;
@@ -43,6 +43,16 @@ my @queue           = ();
 my %pending_queries = ( fifo => [] ); 
 my $last_retry      = 0;
 my $socket_buf      = '';
+my $last_tls_fail = 0;
+my $tls_retry_interval = 20; # 1 Hour (adjust as needed for your fleet)
+# --- HEARTBEAT STATE ---
+my $hb_count   = 0;
+my $hb_latency = 0;
+my $hb_errors  = 0;
+my $hb_start   = get_now();
+my $hb_interval = 60; # Send heartbeat at least every 60s
+my $last_cfg_refresh = get_now();
+my $cfg_refresh_interval = 300; # Auto-refresh every 5 minutes (adjust as needed)
 
 # Declarations for shared configuration variables
 my ($DEBUG, $squidver, $apikey, $charcoal_server, $charcoal_port, $timeout, $default_reply);
@@ -110,6 +120,8 @@ sub load_config {
     }
 }
 
+$CONFIG{original_tls_pref} = $CONFIG{use_tls};
+
 sub refresh_settings {
     load_config();
     $DEBUG           = $d || $CONFIG{debug} || 0;
@@ -120,7 +132,7 @@ sub refresh_settings {
     $timeout         = $CONFIG{timeout} || 3;
     $default_reply   = $f || $CONFIG{default_reply} || 'OK';
 #    $CONFIG{slow_threshold} = (defined $CONFIG{slow_threshold} && $CONFIG{slow_threshold} ne "") ? 0 + $CONFIG{slow_threshold} : 0.1;
-    log_debug("Configuration loaded: Server=$charcoal_server, Port=$charcoal_port, Debug=$DEBUG, Squid Ver=$squidver");
+    log_debug("Configuration loaded: Version: $VERSION, Server=$charcoal_server, Port=$charcoal_port, Debug=$DEBUG, Squid Ver=$squidver");
     log_debug("Engine: $SOCKET_CLASS, Precision: $prec_mode, TLS: $tls_stat, TLS Toggle: $CONFIG{use_tls}, TLS Verify: $CONFIG{tls_verify}");
     log_debug("Connection Timeout: $timeout, Slow Threshold: $CONFIG{slow_threshold}, Default Reply: $default_reply");
 }
@@ -136,13 +148,13 @@ sub get_conn_meta {
     my $tls_status = ($CONFIG{use_tls} || 0) == 1 ? "TLS" : "Plain";
     my $v_status   = (($CONFIG{use_tls} || 0) == 1 && ($CONFIG{tls_verify} || 0) == 1) ? "+Verify" : "-Verify";
     
-    # 1. Determine the actual active class of the current socket
+    # Identify the actual socket class active in memory
     my $active_engine = "None";
     if (defined $socket) {
-        # ref($socket) returns the actual class (e.g., IO::Socket::IP)
         $active_engine = (split(/::/, ref($socket)))[-1] || "Socket";
     }
     
+    # Use the selected_ip stored in current_peer
     return sprintf("%s [%s %s %s]", 
         ($CONFIG{current_peer} || "none"), $active_engine, $tls_status, $v_status);
 }
@@ -182,6 +194,8 @@ sub log_debug {
         $year+1900, $mon+1, $mday, $hour, $min, $sec, $ms, shift;
 }
 
+
+
 $CONFIG{current_peer} = "none";
 $CONFIG{conn_established} = undef;
 
@@ -196,47 +210,110 @@ $SIG{HUP} = sub {
 while (1) {
     my $now = get_now();
 
+    # --- 0. Periodic Config Refresh (Safety Net) ---
+    if ($now - $last_cfg_refresh >= $cfg_refresh_interval) {
+        $last_cfg_refresh = $now;
+        # Only refresh if we are currently disconnected or failing
+        # (This prevents interrupting a perfectly good active socket)
+        if (!$socket) {
+            log_debug("Periodic auto-refresh of settings...");
+            refresh_settings();
+        }
+    }
+    
+    # --- HEARTBEAT TIMER CHECK ---
+    if ($now - $hb_start >= $hb_interval) {
+        flush_heartbeat();
+    }
+    
     # --- 1. Connection & Fallback Management ---
     if (!$socket && @queue) {
         if ($now - $last_retry >= 1) { 
             $last_retry = $now;
-            log_debug("Connecting to $charcoal_server:$charcoal_port...");
             
-            my $should_use_tls = ($HAS_SSL && ($CONFIG{use_tls} || 0) == 1) ? 1 : 0;
-            my %opts = ( PeerAddr => $charcoal_server, PeerPort => $charcoal_port, Proto => 'tcp', Blocking => 1, Timeout => 2 );
-            my $class;
-
-            if ($should_use_tls) {
-                log_debug("Attempting TLS (Blocking)...");
-                $class = "IO::Socket::SSL";
-                $opts{SSL_verify_mode} = ($CONFIG{tls_verify} || 0);
-                $opts{SSL_ciphersuites} = $CONFIG{tls_ciphersuites} if $CONFIG{tls_ciphersuites};
-                $opts{SSL_cipher_list}  = $CONFIG{tls_cipher_list}  if $CONFIG{tls_cipher_list};
-            } else {
-                log_debug("Using Plain-text (Blocking)...");
-                $class = $HAS_IP ? "IO::Socket::IP" : "IO::Socket::INET";
-                log_debug("Engine $class selected...");
-            }
-
-            $socket = $class->new(%opts);
+            # --- FUTURE READINESS: IPv6 MIGRATION ---
+            # To support IPv6, replace 'gethostbyname' with 'Socket::getaddrinfo'.
+            # 'gethostbyname' only returns IPv4 addresses.
+            my @host_info = gethostbyname($charcoal_server);
             
-            if (!$socket) {
-                my $err = $! || "Connection Refused";
-                log_debug("Connect failed: $err.");
-                if ($should_use_tls) {
-                    log_debug("TLS connection failed. Dropping 'use_tls' to 0.");
-                    $CONFIG{use_tls} = 0;
+            if (@host_info) {
+                # DNS Randomization: Distributes load across backend IPs
+                my @raw_ips = @host_info[4..$#host_info];
+                if (@raw_ips) {
+                    my $all_ips = join(', ', map { inet_ntoa($_) } @raw_ips);
+                    my $selected_ip = inet_ntoa($raw_ips[rand @raw_ips]);
+                    log_debug("Selected $selected_ip randomly from $all_ips");
+                                # SELF-HEALING: If TLS was disabled, check if it's time to try again
+                    if ($CONFIG{use_tls} == 0 && ($CONFIG{original_tls_pref} // 0) == 1) {
+                        if ($now - $last_tls_fail > $tls_retry_interval) {
+                            log_debug("TLS Retry Timer reached. Attempting to re-enable TLS...");
+                            $CONFIG{use_tls} = 1;
+                        }
+                    }
+                
+                    log_debug("Attempting connection to $selected_ip (Target: $charcoal_server)...");
+                
+                    my $should_use_tls = ($HAS_SSL && ($CONFIG{use_tls} || 0) == 1) ? 1 : 0;
+                
+                    # Setup core options for the socket
+                    my %opts = ( 
+                        PeerAddr => $selected_ip, 
+                        PeerPort => $charcoal_port, 
+                        Proto    => 'tcp', 
+                        Blocking => 1, 
+                        Timeout  => 2 
+                    );
+
+                    my $class;
+                    if ($should_use_tls) {
+                        log_debug("Engine: IO::Socket::SSL (TLS/Blocking)...");
+                        $class = "IO::Socket::SSL";
+                    
+                        # SSL-Specific Handshake options
+                        $opts{SSL_verify_mode}   = ($CONFIG{tls_verify} || 0);
+                        $opts{SSL_verifycn_name} = $charcoal_server; # Required for SNI with IP-based connection
+                        $opts{SSL_ciphersuites}  = $CONFIG{tls_ciphersuites} if $CONFIG{tls_ciphersuites};
+                        $opts{SSL_cipher_list}   = $CONFIG{tls_cipher_list}  if $CONFIG{tls_cipher_list};
+                    } else {
+                        log_debug("Engine: Standard IPv4 (Blocking)...");
+                        # --- FUTURE READINESS: IPv6 MIGRATION ---
+                        # When moving to dual-stack, change the fallback to 'IO::Socket::IP'.
+                        # For current IPv4-only RB750Gr3 fleet, 'INET' is leaner and more stable.
+                        $class = $HAS_IP ? "IO::Socket::IP" : "IO::Socket::INET";
+                    }
+
+                    # Attempt the socket creation
+                    $socket = $class->new(%opts);
+                
+                    if (!$socket) {
+                        # Capture specific SSL error vs generic socket error
+                        my $err = ($should_use_tls && $IO::Socket::SSL::SSL_ERROR) ? $IO::Socket::SSL::SSL_ERROR : ($! || "Connection Refused");
+                        log_debug("Connect to $selected_ip failed: $err.");
+                    
+                        if ($should_use_tls) {
+                            log_debug("TLS failure. Disabling 'use_tls' for next retry to ensure service continuity.");
+                            $CONFIG{use_tls} = 0;
+                            $last_tls_fail = $now;
+                        }
+                    } else {
+                        # SUCCESS: Move to Non-Blocking state for Squid's IO loop
+                        $socket->blocking(0); 
+                        $sel->add($socket);
+                    
+                        # Use the actual connected IP rather than peerhost() to avoid reverse DNS delays
+                        $CONFIG{current_peer} = $selected_ip;
+                        $CONFIG{conn_established} = get_now();
+                    
+                        log_debug("Connection established to " . get_conn_meta() . " (Non-Blocking). Ready.");
+                    }
+                } else {
+                    log_debug("DNS result returned no valid IP addresses in the host info list.");
                 }
             } else {
-                $socket->blocking(0); 
-                $sel->add($socket);
-                $CONFIG{current_peer} = $socket->peerhost() || $charcoal_server;
-                $CONFIG{conn_established} = get_now();
-                log_debug("Connection established to " . get_conn_meta() . " (Non-Blocking). Ready.");
+                log_debug("DNS Resolution failed for $charcoal_server. Retrying in next cycle.");
             }
         }
     }
-    
     # --- 2. Multiplexing (Read) ---
     my @ready = $sel->can_read(0.01);
     foreach my $fh (@ready) {
@@ -295,7 +372,26 @@ sub handle_socket_read {
         my $current_item = shift @{$pending_queries{fifo}};
         if ($current_item) {
             my $latency = get_now() - $current_item->{sent_at};
-                        
+            
+            # --- UPDATE HEARTBEAT COUNTERS ---
+            $hb_count++;
+            $hb_latency += $latency;
+            
+            # If we hit 100 samples, flush the heartbeat to /dev/log
+            if ($hb_count >= 100) {
+                my $avg = $hb_count > 0 ? ($hb_latency / $hb_count) : 0;
+                my $duration = get_now() - $hb_start;
+                
+                # pri 30 = daemon.info
+                my $hb_msg = sprintf("<30>charcoal-helper: v=\"%s\" msg=\"heartbeat\" samples=%d avg_lat=%.4f errors=%d wall_clock=%.2fs server=\"%s\"", 
+                                     $VERSION, $hb_count, $avg, $hb_errors, $duration, get_conn_meta());
+                send($lp, $hb_msg, 0, $log_dest);
+                
+                # Reset batch
+                $hb_count = 0; $hb_latency = 0; $hb_errors = 0; $hb_start = get_now();
+            }
+            # --- END HEARTBEAT ---
+            
             my $threshold = $CONFIG{slow_threshold} || 0.1;
             if ($latency > $threshold) {
             # IMPORTANT: Pass only the raw number here!
@@ -320,6 +416,9 @@ sub handle_socket_read {
 
 sub retry_or_fail {
     my ($item) = @_;
+    
+    $hb_errors++; # Count this toward our heartbeat error rate
+    
     $item->{retries}++;
     if ($item->{retries} < ($CONFIG{max_retries} || 2)) {
         unshift @queue, $item; 
@@ -345,4 +444,23 @@ sub close_socket {
     foreach my $item (@$inflight) { retry_or_fail($item); }
     $CONFIG{conn_established} = undef;
     $CONFIG{current_peer} = "none";
+}
+
+sub flush_heartbeat {
+    my $now = get_now();
+    my $duration = $now - $hb_start;
+    
+    # Only log if some time has passed or we have data
+    if ($hb_count > 0 || $hb_errors > 0) {
+        my $avg = $hb_count > 0 ? ($hb_latency / $hb_count) : 0;
+        my $conn_meta = get_conn_meta();
+        
+        # We use daemon.info (pri 30) for the pulse
+        my $hb_msg = sprintf("<30>charcoal-helper: v=\"%s\" msg=\"heartbeat\" samples=%d avg_lat=%.4f system_errors=%d wall_clock=%.2fs server=\"%s\"", 
+                             $VERSION, $hb_count, $avg, $hb_errors, $duration, $conn_meta);
+        send($lp, $hb_msg, 0, $log_dest);
+    }
+
+    # Reset batch
+    $hb_count = 0; $hb_latency = 0; $hb_errors = 0; $hb_start = $now;
 }
