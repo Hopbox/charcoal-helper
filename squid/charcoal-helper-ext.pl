@@ -12,9 +12,9 @@
 
 use strict;
 use warnings;
-our $VERSION = '1.2.3';
+our $VERSION = '1.2.4';
 use vars qw($h $d $c $f); # -h (help), -d (debug), -c (compat), -f (fail-mode)
-use IO::Socket;
+use IO::Socket qw(SO_KEEPALIVE IPPROTO_TCP TCP_KEEPIDLE TCP_KEEPINTVL TCP_KEEPCNT);
 use IO::Select;
 use Socket;
 
@@ -297,6 +297,14 @@ while (1) {
                         }
                     } else {
                         # SUCCESS: Move to Non-Blocking state for Squid's IO loop
+                        setsockopt($socket, SOL_SOCKET, SO_LINGER, pack("ii", 1, 0));
+                        setsockopt($socket, SOL_SOCKET, SO_KEEPALIVE, 1);
+                        # TCP Keepalive: Detect dead servers within 60s
+                        eval {
+                            setsockopt($socket, IPPROTO_TCP, TCP_KEEPIDLE, 30);
+                            setsockopt($socket, IPPROTO_TCP, TCP_KEEPINTVL, 10);
+                            setsockopt($socket, IPPROTO_TCP, TCP_KEEPCNT, 3);
+                        }; # May fail on non-Linux, hence eval
                         $socket->blocking(0); 
                         $sel->add($socket);
                     
@@ -358,6 +366,11 @@ sub handle_socket_read {
     my $data;
     my $rv = sysread($socket, $data, 8192);
     if (!defined($rv)) {
+        # Handle connection reset/broken pipe
+        if ($!{ECONNRESET} || $!{EPIPE} || $!{ENOTCONN}) {
+            close_socket("peer_reset_$!");
+            return;
+        }
         return if ($!{EAGAIN} || $!{EWOULDBLOCK});
         close_socket("read_error_$!"); return;
     } elsif ($rv == 0) {
@@ -365,6 +378,16 @@ sub handle_socket_read {
     }
 
     $socket_buf .= $data;
+    
+    # CRITICAL: Timeout stale queries before processing new responses
+    my $now = get_now();
+    while (@{$pending_queries{fifo}} && 
+           ($now - $pending_queries{fifo}[0]{sent_at}) > $CONFIG{timeout} // 5.0) {
+        my $stale = shift @{$pending_queries{fifo}};
+        log_warn("query_expired", $now - $stale->{sent_at}, $stale->{chan});
+        retry_or_fail($stale);
+    }
+    
     while ($socket_buf =~ s/^(.*?)[\r\n]+//) {
         my $response = $1;
         $response =~ s/^\s+|\s+$//g;
