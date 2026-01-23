@@ -82,6 +82,11 @@ if ($h) {
     exit 0;
 }
 
+# --- LOGGING ---
+my $LOG_SOCK_PATH = '/dev/log';
+socket(my $lp, PF_UNIX, SOCK_DGRAM, 0);
+my $log_dest = sockaddr_un($LOG_SOCK_PATH);
+
 # --- CONFIG LOADER ---
 my %CONFIG;
 sub load_config {
@@ -93,6 +98,7 @@ sub load_config {
         $CONFIG{ver}              = `uci -q get charcoal.main.squid_version`    || '3';
         $CONFIG{debug}            = `uci -q get charcoal.main.debug`            || 0;
         $CONFIG{max_retries}      = `uci -q get charcoal.main.max_retries`      || 2;
+        $CONFIG{queue_timeout}    = `uci -q get charcial.main.queue_timeout`    || 10;
         $CONFIG{timeout}          = `uci -q get charcoal.main.timeout`          || 2;
         $CONFIG{slow_threshold}   = `uci -q get charcoal.main.slow_threshold`   || 0.1;
         $CONFIG{default_reply}    = `uci -q get charcoal.main.default_reply`    || 'OK';
@@ -139,10 +145,6 @@ sub refresh_settings {
 
 refresh_settings();
 
-# --- LOGGING ---
-my $LOG_SOCK_PATH = '/dev/log';
-socket(my $lp, PF_UNIX, SOCK_DGRAM, 0);
-my $log_dest = sockaddr_un($LOG_SOCK_PATH);
 
 sub get_conn_meta {
     my $tls_status = ($CONFIG{use_tls} || 0) == 1 ? "TLS" : "Plain";
@@ -187,11 +189,16 @@ sub log_warn {
 
 sub log_debug {
     return unless $DEBUG;
+    my $msg = shift;
     my $now = get_now();
     my ($sec,$min,$hour,$mday,$mon,$year) = localtime();
     my $ms = sprintf("%03d", ($now - int($now)) * 1000);
     printf STDERR "[%04d-%02d-%02d %02d:%02d:%02d.%s] Charcoal: %s\n", 
-        $year+1900, $mon+1, $mday, $hour, $min, $sec, $ms, shift;
+        $year+1900, $mon+1, $mday, $hour, $min, $sec, $ms, $msg;
+        
+    my $pri = 31; # daemon.debug
+    my $log_msg = "<$pri>charcoal-helper: " . $msg;
+    send($lp, $log_msg, 0, $log_dest);
 }
 
 
@@ -226,8 +233,28 @@ while (1) {
         flush_heartbeat();
     }
     
+    my $queue_timeout = $CONFIG{queue_timeout} // 10;
+    
     # --- 1. Connection & Fallback Management ---
     if (!$socket && @queue) {
+        
+        my $failed_attempts = $now - ($CONFIG{conn_established} || 0);
+        
+        if ($failed_attempts > 3) {
+            $queue_timeout = 3;  # Aggressive drain after 3 failed attempts
+        }
+        
+        my $drained = 0;
+        
+        while (@queue && ($now - $queue[0]->{queued_at} > $queue_timeout)) {
+            my $stale = shift @queue;
+            send_to_squid($stale->{chan}, $default_reply);
+            $drained++;
+        }
+        
+        if ($drained > 0){
+            log_warn("queue_timeout_drained count=$drained", 0, "sys");
+        }
         if ($now - $last_retry >= 1) { 
             $last_retry = $now;
             
@@ -322,6 +349,7 @@ while (1) {
             }
         }
     }
+    
     # --- 2. Multiplexing (Read) ---
     my @ready = $sel->can_read(0.01);
     foreach my $fh (@ready) {
@@ -335,6 +363,7 @@ while (1) {
             if ($socket->opened) {
                 log_debug("Sending to server $CONFIG{current_peer}: $item->{payload}");
                 $item->{sent_at} = get_now(); 
+                $item->{queued_at} = $item->{queued_at} || get_now();  # ✅ Preserve original or set now
                 $item->{peer_info} = get_conn_meta(); # Capture meta at send-time
                 print $socket $item->{payload} . "\r\n";
                 push @{$pending_queries{fifo}}, $item;
@@ -357,7 +386,12 @@ sub handle_stdin {
     if ($chunks[0] =~ /^\d+$/) { ($chan, $url, $cip, $id, $meth, $blah) = @chunks; }
     else { $chan = ""; ($url, $cip, $id, $meth, $blah) = @chunks; }
     my $payload = join('|', $apikey, $squidver, ($cip||"-"), ($id||"-"), ($meth||"-"), ($blah||"-"), ($url||"-"));
-    push @queue, { chan => $chan, payload => $payload, retries => 0 };
+    push @queue, { 
+        chan        => $chan, 
+        payload     => $payload, 
+        retries     => 0, 
+        queued_at   => get_now()
+    };
     return 1;
 }
 
@@ -457,14 +491,23 @@ sub send_to_squid {
 
 sub close_socket {
     my $reason = shift || "unknown";
+    my $now = get_now();
     return unless defined $socket;
     log_warn("socket_closed_$reason", 0, "sys");
     $sel->remove($socket) if $sel->exists($socket);
     eval { $socket->shutdown(2) if $socket->opened; $socket->close(); };
-    $socket = undef; $socket_buf = ''; $last_retry = get_now();
+    $socket = undef; $socket_buf = ''; $last_retry = $now;
     my $inflight = $pending_queries{fifo};
     $pending_queries{fifo} = [];
-    foreach my $item (@$inflight) { retry_or_fail($item); }
+    foreach my $item (@$inflight) { 
+        my $age = $now - ($item->{queued_at} || $now);
+        if ($age > $CONFIG{timeout}){
+            send_to_squid($item->{chan}, $default_reply); # Don't retry old queries
+        }
+        else {
+            retry_or_fail($item); 
+        }
+    }
     $CONFIG{conn_established} = undef;
     $CONFIG{current_peer} = "none";
 }

@@ -13,8 +13,10 @@ config main 'main'
 
     # --- PERFORMANCE & TIMEOUTS ---
     # timeout: Seconds to wait for server before fail-over
+    # queue_timeout: how long to hold query in queue on server disconnect before replying with default_reply
     # slow_threshold: Latency (in seconds) that triggers a 'SLOW' warning in logs
     option timeout '2'
+    option queue_timeout '5'
     option max_retries '2'
     option slow_threshold '0.1'
     
