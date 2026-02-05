@@ -3,7 +3,8 @@ package charcoal
 config main 'main'
     # --- GLOBAL CONNECTION SETTINGS ---
     option server 'active.charcoal.io'
-    option port '6603'
+    option tls_port '6605'      # Dedicated port for TLS connections (HAProxy terminates)
+    option plain_port '6603'    # Dedicated port for plain TCP (direct to server)
     option api_key 'YOUR_API_KEY_HERE'
     
     # --- ENGINE & VERSIONING ---
@@ -12,10 +13,31 @@ config main 'main'
     option debug '0'
 
     # --- PERFORMANCE & TIMEOUTS ---
-    # timeout: Seconds to wait for server before fail-over
-    # queue_timeout: how long to hold query in queue on server disconnect before replying with default_reply
+    #
+    # TIMEOUT FORMULA:
+    # -------------------------------------------------------------------------
+    # With separate TLS/Plain ports, the formula is simplified because
+    # TLS failure immediately falls back to plain on different port.
+    #
+    #   queue_timeout = timeout × (max_retries + 1) + 1
+    #
+    # QUICK REFERENCE:
+    # ┌─────────┬─────────┬───────────────┬──────────────────┐
+    # │ timeout │ retries │ queue_timeout │ Max failure time │
+    # ├─────────┼─────────┼───────────────┼──────────────────┤
+    # │    2    │    1    │       5       │      ~4 sec      │
+    # │    2    │    2    │       7       │      ~6 sec      │
+    # │    3    │    1    │       7       │      ~6 sec      │
+    # │    3    │    2    │      10       │      ~9 sec      │
+    # └─────────┴─────────┴───────────────┴──────────────────┘
+    # -------------------------------------------------------------------------
+    #
+    # timeout: Seconds to wait for connection/response before fail-over
+    # queue_timeout: Max time to hold query before replying with default_reply
+    # max_retries: Number of retry attempts per query (0 = no retries)
     # slow_threshold: Latency (in seconds) that triggers a 'SLOW' warning in logs
-    option timeout '3'
+    #
+    option timeout '2'
     option queue_timeout '5'
     option max_retries '1'
     option slow_threshold '0.3'
@@ -25,9 +47,25 @@ config main 'main'
     # ERR = Fail-Closed (Block traffic if server is down)
     option default_reply 'OK'
 
-    # --- TLS / SSL OPTIMIZATION ---
-    option use_tls '1'
-    option tls_verify '1'
+    # --- TLS / SSL SETTINGS ---
+    # use_tls: Enable TLS connection to server (0=disabled, 1=enabled)
+    # tls_verify: Verify server certificate (0=no, 1=yes)
+    #
+    # CONNECTION FLOW:
+    # ┌────────────────────────────────────────────────────────────────┐
+    # │ use_tls=1?                                                     │
+    # │   ├── Yes → TLS connect to tls_port (6605) [blocking]         │
+    # │   │         ├── Success → connected via TLS                   │
+    # │   │         └── Fail → Immediately try plain_port (6603)      │
+    # │   │                    [non-blocking]                         │
+    # │   └── No → Plain TCP connect to plain_port (6603)             │
+    # │            [non-blocking with proper timeout]                  │
+    # └────────────────────────────────────────────────────────────────┘
+    #
+    # Server supports both TLS (via HAProxy on 6605) and plain (direct on 6603)
+    #
+    option use_tls '0'
+    option tls_verify '0'
 
     # CIPHER SELECTION LOGIC:
     # -------------------------------------------------------------------------

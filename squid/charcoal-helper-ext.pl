@@ -1,7 +1,7 @@
 #!/usr/bin/perl -s
 #
 # Charcoal - External ACL helper for squid
-# Version: 1.2.6 (Fully Optimized & Transparent)
+# Version: 1.2.8 (Separate TLS/Plain ports, last_peer tracking, non-blocking connect)
 # Copyright (C) 2012-2026 Unmukti Technology Pvt Ltd <info@unmukti.in>
 #
 # This program is free software; you can redistribute it and/or modify
@@ -12,11 +12,11 @@
 
 use strict;
 use warnings;
-our $VERSION = '1.2.6';
+our $VERSION = '1.2.8';
 use vars qw($h $d $c $f); # -h (help), -d (debug), -c (compat), -f (fail-mode)
 use IO::Socket qw(SO_KEEPALIVE IPPROTO_TCP TCP_KEEPIDLE TCP_KEEPINTVL TCP_KEEPCNT);
 use IO::Select;
-use Socket;
+use Socket qw(SOL_SOCKET SO_ERROR SO_LINGER PF_UNIX SOCK_DGRAM inet_ntoa sockaddr_un);
 
 # --- BOOTSTRAP: MODULE DISCOVERY ---
 my $HAS_HIRES = eval { require Time::HiRes; 1 };
@@ -40,22 +40,31 @@ $| = 1;
 my $socket          = undef;
 my $sel             = IO::Select->new(\*STDIN);
 my @queue           = ();    
+my @retry_queue     = ();    # Separate queue for retries (priority)
 my %pending_queries = ( fifo => [] ); 
 my $last_retry      = 0;
 my $socket_buf      = '';
-my $last_tls_fail = 0;
-my $tls_retry_interval = 20; # 1 Hour (adjust as needed for your fleet)
+my $last_tls_fail   = 0;
+my $tls_retry_interval = 20; # 20 seconds (adjust as needed for your fleet)
+my $write_stall_count = 0;   # Track consecutive write failures
+my $conn_fail_count = 0;     # Track consecutive connection failures
+
 # --- HEARTBEAT STATE ---
+# Heartbeat is sent when EITHER condition is met:
+#   1. hb_count >= hb_count_threshold requests processed, OR
+#   2. hb_interval elapsed since last heartbeat
+# This reduces log volume from 2000+ routers while maintaining visibility
 my $hb_count   = 0;
 my $hb_latency = 0;
 my $hb_errors  = 0;
 my $hb_start   = get_now();
-my $hb_interval = 60; # Send heartbeat at least every 60s
+my $hb_interval = 300; # Time-based heartbeat: every 5 minutes
+my $hb_count_threshold = 1000; # Count-based heartbeat: every 1000 requests
 my $last_cfg_refresh = get_now();
-my $cfg_refresh_interval = 300; # Auto-refresh every 5 minutes (adjust as needed)
+my $cfg_refresh_interval = 300; # Auto-refresh settings every 5 minutes
 
 # Declarations for shared configuration variables
-my ($DEBUG, $squidver, $apikey, $charcoal_server, $charcoal_port, $timeout, $default_reply);
+my ($DEBUG, $squidver, $apikey, $charcoal_server, $charcoal_tls_port, $charcoal_plain_port, $timeout, $default_reply);
 
 my $apikey_arg = @ARGV ? shift @ARGV : undef;
 $squidver = $c ? 2 : 3;
@@ -63,13 +72,12 @@ my $prec_mode = $HAS_HIRES ? "High (Time::HiRes)" : "Low (Standard)";
 my $tls_stat  = $HAS_SSL   ? "Available (IO::Socket::SSL)" : "Disabled (Missing Module)";
 
 # --- INIT ---
-# --- ARGUMENTS & HELP (REINSTATED & ENHANCED) ---
+# --- ARGUMENTS & HELP ---
 if ($h) {
-    
     print STDERR "Charcoal External ACL Helper (Perl) v$VERSION\n";
     print STDERR "=====================================================\n";
     print STDERR "Engine      : $SOCKET_CLASS\n";
-    print STDERR "Preci       : $prec_mode\n";
+    print STDERR "Precision   : $prec_mode\n";
     print STDERR "TLS Support : $tls_stat\n";
     print STDERR "Squid Mode  : " . ($squidver == 2 ? "Legacy (v2.x)" : "Modern (v3.x+)") . "\n";
     print STDERR "-----------------------------------------------------\n";
@@ -93,14 +101,15 @@ sub load_config {
     my $uci_bin = `which uci 2>/dev/null`;
     if ($uci_bin) {
         $CONFIG{server}           = `uci -q get charcoal.main.server`           || 'active.charcoal.io';
-        $CONFIG{port}             = `uci -q get charcoal.main.port`             || '6603';
+        $CONFIG{tls_port}         = `uci -q get charcoal.main.tls_port`         || '6605';
+        $CONFIG{plain_port}       = `uci -q get charcoal.main.plain_port`       || '6603';
         $CONFIG{api_key}          = `uci -q get charcoal.main.api_key`          || 'MISSING_KEY';
         $CONFIG{ver}              = `uci -q get charcoal.main.squid_version`    || '3';
         $CONFIG{debug}            = `uci -q get charcoal.main.debug`            || 0;
-        $CONFIG{max_retries}      = `uci -q get charcoal.main.max_retries`      || 1;
+        $CONFIG{max_retries}      = `uci -q get charcoal.main.max_retries`      || 2;
         $CONFIG{queue_timeout}    = `uci -q get charcoal.main.queue_timeout`    || 10;
-        $CONFIG{timeout}          = `uci -q get charcoal.main.timeout`          || 3;
-        $CONFIG{slow_threshold}   = `uci -q get charcoal.main.slow_threshold`   || 0.3;
+        $CONFIG{timeout}          = `uci -q get charcoal.main.timeout`          || 2;
+        $CONFIG{slow_threshold}   = `uci -q get charcoal.main.slow_threshold`   || 0.1;
         $CONFIG{default_reply}    = `uci -q get charcoal.main.default_reply`    || 'OK';
         $CONFIG{use_tls}          = `uci -q get charcoal.main.use_tls`          || 0;
         $CONFIG{tls_verify}       = `uci -q get charcoal.main.tls_verify`       || 0;
@@ -130,35 +139,37 @@ $CONFIG{original_tls_pref} = $CONFIG{use_tls};
 
 sub refresh_settings {
     load_config();
-    $DEBUG           = $d || $CONFIG{debug} || 0;
-    $squidver        = $c ? 2 : ($CONFIG{ver} || 3);
-    $apikey          = $apikey_arg || $CONFIG{api_key} || 'MISSING_KEY';
-    $charcoal_server = $CONFIG{server} || 'active.charcoal.io';
-    $charcoal_port   = $CONFIG{port} || '6603';
-    $timeout         = $CONFIG{timeout} || 3;
-    $default_reply   = $f || $CONFIG{default_reply} || 'OK';
-#    $CONFIG{slow_threshold} = (defined $CONFIG{slow_threshold} && $CONFIG{slow_threshold} ne "") ? 0 + $CONFIG{slow_threshold} : 0.1;
-    log_debug("Configuration loaded: Version: $VERSION, Server=$charcoal_server, Port=$charcoal_port, Debug=$DEBUG, Squid Ver=$squidver");
+    $DEBUG              = $d || $CONFIG{debug} || 0;
+    $squidver           = $c ? 2 : ($CONFIG{ver} || 3);
+    $apikey             = $apikey_arg || $CONFIG{api_key} || 'MISSING_KEY';
+    $charcoal_server    = $CONFIG{server} || 'active.charcoal.io';
+    $charcoal_tls_port  = $CONFIG{tls_port} || '6605';
+    $charcoal_plain_port = $CONFIG{plain_port} || '6603';
+    $timeout            = $CONFIG{timeout} || 3;
+    $default_reply      = $f || $CONFIG{default_reply} || 'OK';
+    log_debug("Configuration loaded: Version: $VERSION, Server=$charcoal_server, TLS Port=$charcoal_tls_port, Plain Port=$charcoal_plain_port, Debug=$DEBUG, Squid Ver=$squidver");
     log_debug("Engine: $SOCKET_CLASS, Precision: $prec_mode, TLS: $tls_stat, TLS Toggle: $CONFIG{use_tls}, TLS Verify: $CONFIG{tls_verify}");
     log_debug("Connection Timeout: $timeout, Slow Threshold: $CONFIG{slow_threshold}, Default Reply: $default_reply");
 }
 
 refresh_settings();
 
-
 sub get_conn_meta {
     my $tls_status = ($CONFIG{use_tls} || 0) == 1 ? "TLS" : "Plain";
     my $v_status   = (($CONFIG{use_tls} || 0) == 1 && ($CONFIG{tls_verify} || 0) == 1) ? "+Verify" : "-Verify";
     
-    # Identify the actual socket class active in memory
     my $active_engine = "None";
     if (defined $socket) {
         $active_engine = (split(/::/, ref($socket)))[-1] || "Socket";
     }
     
-    # Use the selected_ip stored in current_peer
-    return sprintf("%s [%s %s %s]", 
-        ($CONFIG{current_peer} || "none"), $active_engine, $tls_status, $v_status);
+    # Include last_peer if current_peer is none (for diagnostics after disconnect)
+    my $peer_info = $CONFIG{current_peer} || "none";
+    if ($peer_info eq "none" && $CONFIG{last_peer}) {
+        $peer_info = "none (last: $CONFIG{last_peer})";
+    }
+    
+    return sprintf("%s [%s %s %s]", $peer_info, $active_engine, $tls_status, $v_status);
 }
 
 sub log_warn {
@@ -166,21 +177,16 @@ sub log_warn {
     $latency //= 0;
     
     my $now = get_now();
-    # This line stays: it calculates how long the socket has been open
     my $conn_age = defined $CONFIG{conn_established} ? int($now - $CONFIG{conn_established}) : 0;
-    
-    # This line stays: it gets the [IP TLS Verify] string
     my $conn_meta = get_conn_meta();
 
     my ($sec,$min,$hour,$mday,$mon,$year) = localtime();
     my $ms = sprintf("%03d", ($now - int($now)) * 1000);
     
-    # The printf STILL includes %ds for $conn_age
     printf STDERR "[%04d-%02d-%02d %02d:%02d:%02d.%s] Charcoal: !!! %s [%s] Latency: %.4fs Age: %ds Peer: %s !!!\n", 
         $year+1900, $mon+1, $mday, $hour, $min, $sec, $ms, 
         uc($msg), ($chan // '0'), $latency, $conn_age, $conn_meta;
 
-    # Structured logging for /dev/log also includes age
     my $pri = 28; # daemon.warn
     my $structured = sprintf("<%d>charcoal-helper: v=\"%s\" msg=\"%s\" latency=%.4f chan=%s server=\"%s\" age=%d", 
                              $pri, $VERSION, $msg, $latency, ($chan // 0), $conn_meta, $conn_age);
@@ -202,14 +208,16 @@ sub log_debug {
 }
 
 $CONFIG{current_peer} = "none";
+$CONFIG{last_peer} = undef;  # Track last connected peer for diagnostics
 $CONFIG{conn_established} = undef;
 
+# --- SIGNAL HANDLERS ---
 $SIG{TERM} = $SIG{INT} = sub { 
     log_warn("received_shutdown_signal", 0, "sys");
     close_socket("signal_shutdown") if $socket;
     
-    # Drain pending queries
-    foreach my $item (@queue, @{$pending_queries{fifo}}) {
+    # Drain all queues with default reply
+    foreach my $item (@queue, @retry_queue, @{$pending_queries{fifo}}) {
         send_to_squid($item->{chan}, $default_reply);
     }
     exit(0); 
@@ -221,6 +229,106 @@ $SIG{HUP} = sub {
     log_debug("SIGHUP: Settings applied. Next connect will use: $charcoal_server");
 };
 
+# =============================================================================
+# NON-BLOCKING TCP CONNECT WITH TIMEOUT
+# =============================================================================
+# This function creates a TCP socket with proper timeout handling that works
+# even when firewall DROP rules are in place (unlike IO::Socket::INET's Timeout)
+# =============================================================================
+sub nb_tcp_connect {
+    my ($ip, $port, $connect_timeout) = @_;
+    $connect_timeout ||= 3;
+    
+    my $sock;
+    my $class = $HAS_IP ? "IO::Socket::IP" : "IO::Socket::INET";
+    
+    # Step 1: Create socket in NON-BLOCKING mode
+    $sock = $class->new(
+        PeerAddr => $ip,
+        PeerPort => $port,
+        Proto    => 'tcp',
+        Blocking => 0,  # Critical: non-blocking from the start
+    );
+    
+    # If new() fails immediately (DNS issues, etc)
+    if (!$sock) {
+        my $err = $! || "Socket creation failed";
+        log_debug("nb_tcp_connect: socket creation failed: $err");
+        return (undef, $err);
+    }
+    
+    # Step 2: Wait for socket to become writable (connection complete) with timeout
+    my $conn_sel = IO::Select->new($sock);
+    my @ready = $conn_sel->can_write($connect_timeout);
+    
+    if (!@ready) {
+        # Timeout expired - DROP firewall or network unreachable
+        log_debug("nb_tcp_connect: timeout after ${connect_timeout}s (likely DROP rule or network issue)");
+        $sock->close();
+        return (undef, "Connection timeout (${connect_timeout}s)");
+    }
+    
+    # Step 3: Check if connection actually succeeded via SO_ERROR
+    my $err_packed = getsockopt($sock, SOL_SOCKET, SO_ERROR);
+    if (!defined $err_packed) {
+        log_debug("nb_tcp_connect: getsockopt failed: $!");
+        $sock->close();
+        return (undef, "getsockopt failed: $!");
+    }
+    
+    my $err_code = unpack("I", $err_packed);
+    if ($err_code != 0) {
+        # Connection failed (REJECT, ICMP unreachable, etc.)
+        my $err_msg = "Connection failed: " . ($! = $err_code);
+        log_debug("nb_tcp_connect: SO_ERROR=$err_code ($err_msg)");
+        $sock->close();
+        return (undef, $err_msg);
+    }
+    
+    # Success! Socket is connected.
+    log_debug("nb_tcp_connect: TCP connection established to $ip:$port");
+    return ($sock, undef);
+}
+
+# =============================================================================
+# TLS CONNECTION (BLOCKING - kept simple for OpenWrt compatibility)
+# =============================================================================
+# TLS connections remain blocking because:
+# 1. Non-blocking TLS handshake adds significant complexity
+# 2. If TLS fails, we immediately fallback to plain TCP (which IS non-blocking)
+# 3. TLS uses dedicated port (6605), plain uses port (6603)
+# =============================================================================
+sub tls_connect {
+    my ($ip, $port, $hostname, $connect_timeout) = @_;
+    $connect_timeout ||= 3;
+    
+    return (undef, "IO::Socket::SSL not available") unless $HAS_SSL;
+    
+    my %opts = (
+        PeerAddr          => $ip,
+        PeerPort          => $port,
+        Proto             => 'tcp',
+        Blocking          => 1,
+        Timeout           => $connect_timeout,
+        SSL_verify_mode   => ($CONFIG{tls_verify} || 0),
+        SSL_verifycn_name => $hostname,
+    );
+    $opts{SSL_ciphersuites} = $CONFIG{tls_ciphersuites} if $CONFIG{tls_ciphersuites};
+    $opts{SSL_cipher_list}  = $CONFIG{tls_cipher_list}  if $CONFIG{tls_cipher_list};
+    
+    my $sock = IO::Socket::SSL->new(%opts);
+    
+    if (!$sock) {
+        no warnings 'once';  # $IO::Socket::SSL::SSL_ERROR is a valid package var
+        my $err = $IO::Socket::SSL::SSL_ERROR || $! || "TLS connection failed";
+        log_debug("tls_connect: failed: $err");
+        return (undef, $err);
+    }
+    
+    log_debug("tls_connect: TLS connection established to $ip:$port");
+    return ($sock, undef);
+}
+
 # --- MAIN LOOP ---
 while (1) {
     my $now = get_now();
@@ -228,8 +336,6 @@ while (1) {
     # --- 0. Periodic Config Refresh (Safety Net) ---
     if ($now - $last_cfg_refresh >= $cfg_refresh_interval) {
         $last_cfg_refresh = $now;
-        # Only refresh if we are currently disconnected or failing
-        # (This prevents interrupting a perfectly good active socket)
         if (!$socket) {
             log_debug("Periodic auto-refresh of settings...");
             refresh_settings();
@@ -244,41 +350,54 @@ while (1) {
     my $queue_timeout = $CONFIG{queue_timeout} // 10;
     
     # --- 1. Connection & Fallback Management ---
-    if (!$socket && @queue) {
+    if (!$socket && (@queue || @retry_queue)) {
         
-        my $failed_attempts = $now - ($CONFIG{conn_established} || 0);
+        my $time_since_last_conn = $now - ($CONFIG{conn_established} || 0);
         
-        if ($failed_attempts > 3) {
-            $queue_timeout = 3;  # Aggressive drain after 3 failed attempts
+        # Adaptive queue timeout: aggressive after prolonged disconnection
+        if ($time_since_last_conn > 3) {
+            $queue_timeout = 3;
         }
         
         my $drained = 0;
         
+        # Drain @queue items that exceed queue_timeout AND have exhausted retries
         while (@queue && ($now - $queue[0]->{queued_at} > $queue_timeout)) {
-            my $stale = shift @queue;
-            send_to_squid($stale->{chan}, $default_reply);
+            my $item = shift @queue;
+            $item->{retries}++;
+            if ($item->{retries} < ($CONFIG{max_retries} || 2)) {
+                # Still has retries left - move to retry queue
+                push @retry_queue, $item;
+            } else {
+                # Exhausted retries - send default reply
+                send_to_squid($item->{chan}, $default_reply);
+                $drained++;
+            }
+        }
+        
+        # Also drain @retry_queue items that are too old (2x queue_timeout for retries)
+        while (@retry_queue && ($now - $retry_queue[0]->{queued_at} > $queue_timeout * 2)) {
+            my $item = shift @retry_queue;
+            send_to_squid($item->{chan}, $default_reply);
             $drained++;
         }
         
         if ($drained > 0){
             log_warn("queue_timeout_drained count=$drained", 0, "sys");
         }
+        
         if ($now - $last_retry >= 1) { 
             $last_retry = $now;
             
-            # --- FUTURE READINESS: IPv6 MIGRATION ---
-            # To support IPv6, replace 'gethostbyname' with 'Socket::getaddrinfo'.
-            # 'gethostbyname' only returns IPv4 addresses.
             my @host_info = gethostbyname($charcoal_server);
             
             if (@host_info) {
-                # DNS Randomization: Distributes load across backend IPs
                 my @raw_ips = @host_info[4..$#host_info];
                 if (@raw_ips) {
                     my $all_ips = join(', ', map { inet_ntoa($_) } @raw_ips);
                     my $selected_ip = inet_ntoa($raw_ips[rand @raw_ips]);
                     log_debug("Selected $selected_ip randomly from $all_ips");
-                                # SELF-HEALING: If TLS was disabled, check if it's time to try again
+                    
                     if ($CONFIG{use_tls} == 0 && ($CONFIG{original_tls_pref} // 0) == 1) {
                         if ($now - $last_tls_fail > $tls_retry_interval) {
                             log_debug("TLS Retry Timer reached. Attempting to re-enable TLS...");
@@ -286,68 +405,100 @@ while (1) {
                         }
                     }
                 
-                    log_debug("Attempting connection to $selected_ip (Target: $charcoal_server)...");
-                
                     my $should_use_tls = ($HAS_SSL && ($CONFIG{use_tls} || 0) == 1) ? 1 : 0;
-                
-                    # Setup core options for the socket
-                    my %opts = ( 
-                        PeerAddr => $selected_ip, 
-                        PeerPort => $charcoal_port, 
-                        Proto    => 'tcp', 
-                        Blocking => 1, 
-                        Timeout  => ($CONFIG{timeout} || 3) 
-                    );
-
-                    my $class;
+                    my $connect_timeout = $CONFIG{timeout} || 3;
+                    
+                    my ($new_sock, $conn_err);
+                    my $target_port;
+                    
                     if ($should_use_tls) {
-                        log_debug("Engine: IO::Socket::SSL (TLS/Blocking)...");
-                        $class = "IO::Socket::SSL";
-                    
-                        # SSL-Specific Handshake options
-                        $opts{SSL_verify_mode}   = ($CONFIG{tls_verify} || 0);
-                        $opts{SSL_verifycn_name} = $charcoal_server; # Required for SNI with IP-based connection
-                        $opts{SSL_ciphersuites}  = $CONFIG{tls_ciphersuites} if $CONFIG{tls_ciphersuites};
-                        $opts{SSL_cipher_list}   = $CONFIG{tls_cipher_list}  if $CONFIG{tls_cipher_list};
-                    } else {
-                        log_debug("Engine: Standard IPv4 (Blocking)...");
-                        # --- FUTURE READINESS: IPv6 MIGRATION ---
-                        # When moving to dual-stack, change the fallback to 'IO::Socket::IP'.
-                        # For current IPv4-only RB750Gr3 fleet, 'INET' is leaner and more stable.
-                        $class = $HAS_IP ? "IO::Socket::IP" : "IO::Socket::INET";
-                    }
-
-                    # Attempt the socket creation
-                    $socket = $class->new(%opts);
-                
-                    if (!$socket) {
-                        # Capture specific SSL error vs generic socket error
-                        my $err = ($should_use_tls && $IO::Socket::SSL::SSL_ERROR) ? $IO::Socket::SSL::SSL_ERROR : ($! || "Connection Refused");
-                        log_debug("Connect to $selected_ip failed: $err.");
-                    
-                        if ($should_use_tls) {
-                            log_debug("TLS failure. Disabling 'use_tls' for next retry to ensure service continuity.");
-                            $CONFIG{use_tls} = 0;
-                            $last_tls_fail = $now;
+                        # =====================================================
+                        # TLS: Use dedicated TLS port (6605), blocking connect
+                        # If fails, immediately try plain on port 6603
+                        # =====================================================
+                        $target_port = $charcoal_tls_port;
+                        log_debug("Attempting TLS connection to $selected_ip:$target_port...");
+                        ($new_sock, $conn_err) = tls_connect($selected_ip, $target_port, $charcoal_server, $connect_timeout);
+                        
+                        if (!$new_sock) {
+                            log_debug("TLS connection failed: $conn_err");
+                            log_debug("Falling back to plain TCP on port $charcoal_plain_port...");
+                            
+                            # Immediately try plain TCP (non-blocking)
+                            $target_port = $charcoal_plain_port;
+                            ($new_sock, $conn_err) = nb_tcp_connect($selected_ip, $target_port, $connect_timeout);
+                            
+                            if ($new_sock) {
+                                # Plain worked! Disable TLS temporarily
+                                log_debug("Plain TCP fallback succeeded. Disabling TLS for $tls_retry_interval seconds.");
+                                $CONFIG{use_tls} = 0;
+                                $last_tls_fail = $now;
+                            }
                         }
                     } else {
-                        # SUCCESS: Move to Non-Blocking state for Squid's IO loop
+                        # =====================================================
+                        # Plain TCP: Use dedicated plain port (6603), non-blocking
+                        # =====================================================
+                        $target_port = $charcoal_plain_port;
+                        log_debug("Attempting plain TCP connection to $selected_ip:$target_port...");
+                        ($new_sock, $conn_err) = nb_tcp_connect($selected_ip, $target_port, $connect_timeout);
+                    }
+                    
+                    if (!$new_sock) {
+                        log_debug("Connect to $selected_ip:$target_port failed: $conn_err");
+                        $conn_fail_count++;
+                        
+                        # After max_retries+1 connection failures, process queued items
+                        if ($conn_fail_count > ($CONFIG{max_retries} || 1)) {
+                            my $processed = 0;
+                            
+                            # Process @queue - give items their retry or fail them
+                            while (my $item = shift @queue) {
+                                $item->{retries}++;
+                                if ($item->{retries} < ($CONFIG{max_retries} || 2)) {
+                                    push @retry_queue, $item;
+                                } else {
+                                    send_to_squid($item->{chan}, $default_reply);
+                                    $processed++;
+                                }
+                            }
+                            
+                            # Process @retry_queue - these already had their retry
+                            while (my $item = shift @retry_queue) {
+                                send_to_squid($item->{chan}, $default_reply);
+                                $processed++;
+                            }
+                            
+                            if ($processed > 0) {
+                                log_warn("conn_fail_drained count=$processed after=$conn_fail_count attempts", 0, "sys");
+                            }
+                            
+                            $conn_fail_count = 0;  # Reset for next batch
+                        }
+                        
+                    } else {
+                        # Connection successful!
+                        $conn_fail_count = 0;
+                        $socket = $new_sock;
+                        
+                        # Apply socket options
                         setsockopt($socket, SOL_SOCKET, SO_LINGER, pack("ii", 1, 0));
                         setsockopt($socket, SOL_SOCKET, SO_KEEPALIVE, 1);
-                        # TCP Keepalive: Detect dead servers within 60s
                         eval {
                             setsockopt($socket, IPPROTO_TCP, TCP_KEEPIDLE, 30);
                             setsockopt($socket, IPPROTO_TCP, TCP_KEEPINTVL, 10);
                             setsockopt($socket, IPPROTO_TCP, TCP_KEEPCNT, 3);
-                        }; # May fail on non-Linux, hence eval
+                        };
+                        
+                        # Ensure non-blocking mode for I/O
                         $socket->blocking(0); 
                         $sel->add($socket);
                     
-                        # Use the actual connected IP rather than peerhost() to avoid reverse DNS delays
                         $CONFIG{current_peer} = $selected_ip;
+                        $CONFIG{last_peer} = $selected_ip;  # Track for diagnostics
                         $CONFIG{conn_established} = get_now();
                     
-                        log_debug("Connection established to " . get_conn_meta() . " (Non-Blocking). Ready.");
+                        log_debug("Connection established to " . get_conn_meta() . ". Ready.");
                     }
                 } else {
                     log_debug("DNS result returned no valid IP addresses in the host info list.");
@@ -359,15 +510,14 @@ while (1) {
     }
     
     # --- 2. Periodic Timeout Check (WAN Failure Protection) ---
-    # Even if socket appears alive, check for expired in-flight queries
-     if (@{$pending_queries{fifo}}) {
-         while (@{$pending_queries{fifo}} && 
-                ($now - $pending_queries{fifo}[0]{sent_at}) > ($CONFIG{timeout} || 5.0)) {
-             my $stale = shift @{$pending_queries{fifo}};
-             log_warn("query_expired_wan_timeout", $now - $stale->{sent_at}, $stale->{chan});
-             retry_or_fail($stale);
-         }
-     }
+    if (@{$pending_queries{fifo}}) {
+        while (@{$pending_queries{fifo}} && 
+               ($now - $pending_queries{fifo}[0]{sent_at}) > ($CONFIG{timeout} || 5.0)) {
+            my $stale = shift @{$pending_queries{fifo}};
+            log_warn("query_expired_wan_timeout", $now - $stale->{sent_at}, $stale->{chan});
+            retry_or_fail($stale);
+        }
+    }
     
     # --- 3. Multiplexing (Read) ---
     my @ready = $sel->can_read(0.01);
@@ -377,18 +527,47 @@ while (1) {
     }
 
     # --- 4. Transmission (Send) ---
-    if ($socket && @queue && $sel->can_write(0)) {
-        while (my $item = shift @queue) {
+    if ($socket && $sel->can_write(0)) {
+        $write_stall_count = 0;  # Reset on successful write availability
+        
+        # Priority 1: Send retries first (these already failed once)
+        while (my $item = shift @retry_queue) {
             if ($socket->opened) {
-                log_debug("Sending to server $CONFIG{current_peer}: $item->{payload}");
-                $item->{sent_at} = get_now(); 
-                $item->{queued_at} = $item->{queued_at} || get_now();  # ✅ Preserve original or set now
-                $item->{peer_info} = get_conn_meta(); # Capture meta at send-time
+                log_debug("Retrying to server $CONFIG{current_peer}: $item->{payload} (attempt " . ($item->{retries}+1) . ")");
+                $item->{sent_at} = get_now();
+                $item->{queued_at} = $item->{queued_at} || get_now();
+                $item->{peer_info} = get_conn_meta();
                 print $socket $item->{payload} . "\r\n";
                 push @{$pending_queries{fifo}}, $item;
             } else {
-                unshift @queue, $item; last;
+                unshift @retry_queue, $item;
+                last;
             }
+        }
+        
+        # Priority 2: Send fresh queries
+        while (my $item = shift @queue) {
+            if ($socket->opened) {
+                log_debug("Sending to server $CONFIG{current_peer}: $item->{payload}");
+                $item->{sent_at} = get_now();
+                $item->{queued_at} = $item->{queued_at} || get_now();
+                $item->{peer_info} = get_conn_meta();
+                print $socket $item->{payload} . "\r\n";
+                push @{$pending_queries{fifo}}, $item;
+            } else {
+                unshift @queue, $item;
+                last;
+            }
+        }
+    }
+    
+    # --- 5. Write Stall Detection (DROP firewall / silent WAN failure) ---
+    if ($socket && (@queue || @retry_queue) && !$sel->can_write(0)) {
+        $write_stall_count++;
+        if ($write_stall_count > 50) {  # ~0.5 seconds of stall (50 * 10ms loop)
+            log_warn("write_stall_detected stalls=$write_stall_count", 0, "sys");
+            close_socket("write_stall");
+            $write_stall_count = 0;
         }
     }
 }
@@ -416,31 +595,61 @@ sub handle_stdin {
 
 sub handle_socket_read {
     return unless (defined $socket && $socket->opened);
-    my $data;
-    my $rv = sysread($socket, $data, 8192);
-    if (!defined($rv)) {
-        # Handle connection reset/broken pipe
-        if ($!{ECONNRESET} || $!{EPIPE} || $!{ENOTCONN}) {
-            close_socket("peer_reset_$!");
+    
+    # For legacy server compatibility: when we have pending queries and data arrives,
+    # do a small wait to allow the server to flush any buffered responses.
+    # This helps with servers that don't flush after each response.
+    my $pending_count = scalar @{$pending_queries{fifo}};
+    if ($pending_count > 1) {
+        # Small delay (10ms) to let more data arrive if server is buffering
+        select(undef, undef, undef, 0.01);
+    }
+    
+    # Drain the socket aggressively - legacy servers may send responses in chunks
+    my $total_read = 0;
+    my $max_reads = 100;  # Safety limit
+    my $reads = 0;
+    
+    while ($reads < $max_reads) {
+        $reads++;
+        my $data;
+        my $rv = sysread($socket, $data, 8192);
+        
+        if (!defined($rv)) {
+            if ($!{ECONNRESET} || $!{EPIPE} || $!{ENOTCONN}) {
+                close_socket("peer_reset_$!");
+                return;
+            }
+            # EAGAIN/EWOULDBLOCK means no more data available right now
+            last if ($!{EAGAIN} || $!{EWOULDBLOCK});
+            close_socket("read_error_$!"); 
+            return;
+        } elsif ($rv == 0) {
+            close_socket("EOF_idle_timeout"); 
             return;
         }
-        return if ($!{EAGAIN} || $!{EWOULDBLOCK});
-        close_socket("read_error_$!"); return;
-    } elsif ($rv == 0) {
-        close_socket("EOF_idle_timeout"); return;
+        
+        $socket_buf .= $data;
+        $total_read += $rv;
+        
+        # If we got less than requested, likely no more data pending
+        last if $rv < 8192;
     }
-
-    $socket_buf .= $data;
     
-    # CRITICAL: Timeout stale queries before processing new responses
+    log_debug("Socket drained: $total_read bytes in $reads read(s)") if $total_read > 0 && $DEBUG;
+    
+    # Process any complete responses in the buffer
     my $now = get_now();
+    
+    # First, expire any stale queries
     while (@{$pending_queries{fifo}} && 
-           ($now - $pending_queries{fifo}[0]{sent_at}) > $CONFIG{timeout} // 5.0) {
+           ($now - $pending_queries{fifo}[0]{sent_at}) > ($CONFIG{timeout} || 5.0)) {
         my $stale = shift @{$pending_queries{fifo}};
         log_warn("query_expired", $now - $stale->{sent_at}, $stale->{chan});
         retry_or_fail($stale);
     }
     
+    # Parse complete lines from buffer
     while ($socket_buf =~ s/^(.*?)[\r\n]+//) {
         my $response = $1;
         $response =~ s/^\s+|\s+$//g;
@@ -449,31 +658,25 @@ sub handle_socket_read {
         if ($current_item) {
             my $latency = get_now() - $current_item->{sent_at};
             
-            # --- UPDATE HEARTBEAT COUNTERS ---
             $hb_count++;
             $hb_latency += $latency;
             
-            # If we hit 100 samples, flush the heartbeat to /dev/log
-            if ($hb_count >= 100) {
+            if ($hb_count >= $hb_count_threshold) {
                 my $avg = $hb_count > 0 ? ($hb_latency / $hb_count) : 0;
                 my $duration = get_now() - $hb_start;
                 
-                # pri 30 = daemon.info
                 my $hb_msg = sprintf("<30>charcoal-helper: v=\"%s\" msg=\"heartbeat\" samples=%d avg_lat=%.4f errors=%d wall_clock=%.2fs server=\"%s\"", 
                                      $VERSION, $hb_count, $avg, $hb_errors, $duration, get_conn_meta());
                 send($lp, $hb_msg, 0, $log_dest);
                 
-                # Reset batch
                 $hb_count = 0; $hb_latency = 0; $hb_errors = 0; $hb_start = get_now();
             }
-            # --- END HEARTBEAT ---
             
             my $threshold = $CONFIG{slow_threshold} || 0.1;
             if ($latency > $threshold) {
-            # IMPORTANT: Pass only the raw number here!
                 log_warn("slow_response", $latency, $current_item->{chan});
             }
-            # We still use peer_meta here because it makes the debug trace useful.
+            
             if ($DEBUG) {
                 my $peer_meta = $current_item->{peer_info} || get_conn_meta();
                 log_debug(sprintf("Received [Chan: %s] [Peer: %s] Latency: %.4fs - Response: %s", 
@@ -493,11 +696,11 @@ sub handle_socket_read {
 sub retry_or_fail {
     my ($item) = @_;
     
-    $hb_errors++; # Count this toward our heartbeat error rate
+    $hb_errors++;
     
     $item->{retries}++;
     if ($item->{retries} < ($CONFIG{max_retries} || 2)) {
-        unshift @queue, $item; 
+        push @retry_queue, $item;  # Use separate retry queue (priority)
     } else { 
         send_to_squid($item->{chan}, $default_reply); 
     }
@@ -512,40 +715,47 @@ sub close_socket {
     my $reason = shift || "unknown";
     my $now = get_now();
     return unless defined $socket;
+    
     log_warn("socket_closed_$reason", 0, "sys");
     $sel->remove($socket) if $sel->exists($socket);
     eval { $socket->shutdown(2) if $socket->opened; $socket->close(); };
     $socket = undef; $socket_buf = ''; $last_retry = $now;
+    
     my $inflight = $pending_queries{fifo};
     $pending_queries{fifo} = [];
+    
+    my $drained = 0;
     foreach my $item (@$inflight) { 
         my $age = $now - ($item->{queued_at} || $now);
-        if ($age > $CONFIG{timeout}){
-            send_to_squid($item->{chan}, $default_reply); # Don't retry old queries
-        }
-        else {
-            retry_or_fail($item); 
+        if ($age > ($CONFIG{timeout} || 5)) {
+            send_to_squid($item->{chan}, $default_reply);
+            $drained++;
+        } else {
+            retry_or_fail($item);
         }
     }
+    
+    if ($drained > 0) {
+        log_warn("drained_stale_pending count=$drained", 0, "sys");
+    }
+    
     $CONFIG{conn_established} = undef;
     $CONFIG{current_peer} = "none";
+    # NOTE: We intentionally do NOT clear last_peer here for diagnostics
 }
 
 sub flush_heartbeat {
     my $now = get_now();
     my $duration = $now - $hb_start;
     
-    # Only log if some time has passed or we have data
     if ($hb_count > 0 || $hb_errors > 0) {
         my $avg = $hb_count > 0 ? ($hb_latency / $hb_count) : 0;
         my $conn_meta = get_conn_meta();
         
-        # We use daemon.info (pri 30) for the pulse
         my $hb_msg = sprintf("<30>charcoal-helper: v=\"%s\" msg=\"heartbeat\" samples=%d avg_lat=%.4f system_errors=%d wall_clock=%.2fs server=\"%s\"", 
                              $VERSION, $hb_count, $avg, $hb_errors, $duration, $conn_meta);
         send($lp, $hb_msg, 0, $log_dest);
     }
 
-    # Reset batch
     $hb_count = 0; $hb_latency = 0; $hb_errors = 0; $hb_start = $now;
 }
